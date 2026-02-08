@@ -34,22 +34,13 @@ from nemo_evaluator.adapters.types import (
 from nemo_evaluator.logging import BaseLoggingParams, get_logger
 
 
+@final
 @register_for_adapter(
     name="reasoning",
     description="Processes reasoning content in API responses",
 )
-@final
 class ResponseReasoningInterceptor(ResponseInterceptor, PostEvalHook):
-    """Adds reasoning information to responses and tracks reasoning metrics.
-
-    Tracks the following statistics:
-    - Total responses processed
-    - Responses with reasoning content
-    - Reasoning completion status (started/finished)
-    - Word counts for reasoning, original content, and updated content
-    - Maximum reasoning length
-    - Average reasoning and content lengths
-    """
+    """Processes reasoning tokens from response. Collects statistics. Strips and/or moves reasoning tokens."""
 
     class Params(BaseLoggingParams):
         """Configuration parameters for reasoning interceptor."""
@@ -136,6 +127,8 @@ class ResponseReasoningInterceptor(ResponseInterceptor, PostEvalHook):
             "responses_with_reasoning": 0,
             "reasoning_finished_count": 0,
             "reasoning_started_count": 0,
+            "reasoning_unfinished_count": 0,
+            "reasoning_finished_ratio": 0,
             "avg_reasoning_words": None,
             "avg_original_content_words": None,
             "avg_updated_content_words": None,
@@ -290,12 +283,18 @@ class ResponseReasoningInterceptor(ResponseInterceptor, PostEvalHook):
             )
 
             # Increment counters
-            if reasoning_words > 0:
+            if (
+                reasoning_words == "unknown"
+                and reasoning_info.get("reasoning_started") is True
+            ) or (isinstance(reasoning_words, int) and reasoning_words > 0):
+                # if reasoning started but not finished, or finished and we have non-zero reasoning words
                 self._reasoning_stats["responses_with_reasoning"] += 1
-            if reasoning_info.get("reasoning_started"):
+            if reasoning_info.get("reasoning_started") is True:
                 self._reasoning_stats["reasoning_started_count"] += 1
-            if reasoning_info.get("reasoning_finished"):
-                self._reasoning_stats["reasoning_finished_count"] += 1
+                if reasoning_info.get("reasoning_finished"):
+                    self._reasoning_stats["reasoning_finished_count"] += 1
+                else:
+                    self._reasoning_stats["reasoning_unfinished_count"] += 1
 
             # Update running averages
             for stat_key, value in [
@@ -347,6 +346,13 @@ class ResponseReasoningInterceptor(ResponseInterceptor, PostEvalHook):
             if updated_content_tokens != "unknown":
                 self._reasoning_stats["total_updated_content_tokens"] += (
                     updated_content_tokens
+                )
+
+            # Update ratio
+            if self._reasoning_stats["responses_with_reasoning"]:
+                self._reasoning_stats["reasoning_finished_ratio"] = (
+                    self._reasoning_stats["reasoning_finished_count"]
+                    / self._reasoning_stats["responses_with_reasoning"]
                 )
 
             # Log aggregated stats at specified interval

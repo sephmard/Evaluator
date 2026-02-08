@@ -46,8 +46,18 @@ class TestCLIWorkflowIntegration:
                 "api_endpoint": {"api_key_name": "test_key", "model_id": "test_model"}
             },
             "evaluation": [
-                {"name": "test_task_1", "overrides": {"param1": "value1"}},
-                {"name": "test_task_2", "overrides": {"param2": "value2"}},
+                {
+                    "name": "test_task_1",
+                    "nemo_evaluator_config": {
+                        "config": {"params": {"param1": "value1"}}
+                    },
+                },
+                {
+                    "name": "test_task_2",
+                    "nemo_evaluator_config": {
+                        "config": {"params": {"param2": "value2"}}
+                    },
+                },
             ],
         }
 
@@ -55,7 +65,7 @@ class TestCLIWorkflowIntegration:
             mock_compose.return_value = OmegaConf.create(config_dict)
 
             # Run evaluation
-            run_cmd = RunCmd(config_name="test_config")
+            run_cmd = RunCmd()
             run_cmd.execute()
 
             # Get the invocation ID from the print output
@@ -174,13 +184,13 @@ class TestCLIWorkflowIntegration:
             "deployment": {"type": "none"},
             "execution": {"type": "dummy", "output_dir": "/tmp/test1"},
             "target": {"api_endpoint": {"api_key_name": "key1", "model_id": "model1"}},
-            "evaluation": [{"name": "task1", "overrides": {}}],
+            "evaluation": [{"name": "task1"}],
         }
 
         with patch("nemo_evaluator_launcher.api.types.hydra.compose") as mock_compose:
             mock_compose.return_value = OmegaConf.create(config1)
 
-            run_cmd1 = RunCmd(config_name="config1")
+            run_cmd1 = RunCmd()
             run_cmd1.execute()
 
             invocation_id1 = extract_invocation_id(mock_print)
@@ -192,13 +202,13 @@ class TestCLIWorkflowIntegration:
                 "target": {
                     "api_endpoint": {"api_key_name": "key2", "model_id": "model2"}
                 },
-                "evaluation": [{"name": "task2", "overrides": {}}],
+                "evaluation": [{"name": "task2"}],
             }
 
             mock_compose.return_value = OmegaConf.create(config2)
 
             with patch("builtins.print") as mock_print2:
-                run_cmd2 = RunCmd(config_name="config2")
+                run_cmd2 = RunCmd()
                 run_cmd2.execute()
 
                 invocation_id2 = extract_invocation_id(mock_print2)
@@ -246,8 +256,8 @@ class TestCLIWorkflowIntegration:
             "execution": {"type": "dummy", "output_dir": "/tmp/test"},
             "target": {"api_endpoint": {"api_key_name": "key", "model_id": "model"}},
             "evaluation": [
-                {"name": "task1", "overrides": {}},
-                {"name": "task2", "overrides": {}},
+                {"name": "task1"},
+                {"name": "task2"},
             ],
         }
 
@@ -292,8 +302,8 @@ class TestCLIWorkflowIntegration:
             "execution": {"type": "dummy", "output_dir": "/tmp/test"},
             "target": {"api_endpoint": {"api_key_name": "key", "model_id": "model"}},
             "evaluation": [
-                {"name": "task1", "overrides": {}},
-                {"name": "task2", "overrides": {}},
+                {"name": "task1"},
+                {"name": "task2"},
             ],
         }
 
@@ -342,7 +352,7 @@ class TestCLIWorkflowIntegration:
             "deployment": {"type": "none"},
             "execution": {"type": "dummy", "output_dir": "/tmp/test"},
             "target": {"api_endpoint": {"api_key_name": "key", "model_id": "model"}},
-            "evaluation": [{"name": "task1", "overrides": {}}],
+            "evaluation": [{"name": "task1"}],
         }
 
         with patch("nemo_evaluator_launcher.api.types.hydra.compose") as mock_compose:
@@ -438,11 +448,15 @@ class TestCLIWorkflowIntegration:
             "evaluation": [
                 {
                     "name": "mmlu",
-                    "overrides": {"model_args": "temperature=0.1", "num_fewshot": 5},
+                    "nemo_evaluator_config": {
+                        "config": {"params": {"temperature": 0.1, "num_fewshot": 5}}
+                    },
                 },
                 {
                     "name": "arc",
-                    "overrides": {"model_args": "temperature=0.0", "num_fewshot": 0},
+                    "nemo_evaluator_config": {
+                        "config": {"params": {"temperature": 0.0, "num_fewshot": 0}}
+                    },
                 },
             ],
         }
@@ -452,7 +466,6 @@ class TestCLIWorkflowIntegration:
 
             # Run evaluation
             run_cmd = RunCmd(
-                config_name="realistic",
                 override=["target.api_endpoint.model_id=gpt-4-turbo"],
             )
             run_cmd.execute()
@@ -684,3 +697,125 @@ def test_ls_runs_basic(mock_execdb, capsys):
     out = capsys.readouterr().out
     assert "invocation_id" in out
     assert "earliest_job_ts" in out
+
+
+class TestCLIConfigParameter:
+    """Test CLI --config parameter functionality."""
+
+    def test_config_parameter_splits_path_correctly(
+        self, mock_execdb, mock_api_endpoint_check, mock_print, tmp_path
+    ):
+        """Test that --config parameter is passed to Hydra correctly."""
+        import pathlib
+
+        # Create a test config file
+        config_dir = tmp_path / "test_configs"
+        config_dir.mkdir()
+        config_file = config_dir / "my_config.yaml"
+        config_file.write_text("test: config")
+
+        config_dict = {
+            "deployment": {"type": "none"},
+            "execution": {"type": "dummy", "output_dir": "/tmp/test_output"},
+            "target": {
+                "api_endpoint": {"api_key_name": "test_key", "model_id": "test_model"}
+            },
+            "evaluation": [{"name": "test_task_1"}],
+        }
+
+        with (
+            patch(
+                "nemo_evaluator_launcher.api.types.hydra.initialize_config_dir"
+            ) as mock_init,
+            patch("nemo_evaluator_launcher.api.types.hydra.compose") as mock_compose,
+        ):
+            mock_compose.return_value = OmegaConf.create(config_dict)
+
+            # Test with absolute path
+            run_cmd = RunCmd(config=str(config_file))
+            run_cmd.execute()
+
+            # Verify hydra.initialize_config_dir was called with correct config_dir
+            mock_init.assert_called_once()
+            init_call_kwargs = mock_init.call_args.kwargs
+            assert init_call_kwargs["config_dir"] == str(config_dir)
+
+            # Verify hydra.compose was called with correct config_name
+            mock_compose.assert_called_once()
+            compose_call_kwargs = mock_compose.call_args.kwargs
+            assert compose_call_kwargs["config_name"] == "my_config"
+
+        # Test with relative path
+        with (
+            patch(
+                "nemo_evaluator_launcher.api.types.hydra.initialize_config_dir"
+            ) as mock_init,
+            patch("nemo_evaluator_launcher.api.types.hydra.compose") as mock_compose,
+        ):
+            mock_compose.return_value = OmegaConf.create(config_dict)
+
+            # Change to parent directory to test relative path
+            original_cwd = pathlib.Path.cwd()
+            try:
+                import os
+
+                os.chdir(config_dir.parent)
+                relative_path = pathlib.Path(config_dir.name) / "my_config.yaml"
+                run_cmd = RunCmd(config=str(relative_path))
+                run_cmd.execute()
+
+                # Verify hydra.initialize_config_dir was called with correct config_dir (absolute)
+                mock_init.assert_called_once()
+                init_call_kwargs = mock_init.call_args.kwargs
+                assert init_call_kwargs["config_dir"] == str(config_dir)
+
+                # Verify hydra.compose was called with correct config_name
+                mock_compose.assert_called_once()
+                compose_call_kwargs = mock_compose.call_args.kwargs
+                assert compose_call_kwargs["config_name"] == "my_config"
+            finally:
+                os.chdir(original_cwd)
+
+    def test_config_parameter_with_various_extensions(
+        self, mock_execdb, mock_api_endpoint_check, mock_print, tmp_path
+    ):
+        """Test that --config parameter works with various file extensions."""
+        config_dir = tmp_path / "test_configs"
+        config_dir.mkdir()
+
+        config_dict = {
+            "deployment": {"type": "none"},
+            "execution": {"type": "dummy", "output_dir": "/tmp/test_output"},
+            "target": {
+                "api_endpoint": {"api_key_name": "test_key", "model_id": "test_model"}
+            },
+            "evaluation": [{"name": "test_task_1"}],
+        }
+
+        # Test with .yaml extension
+        config_file_yaml = config_dir / "test_config.yaml"
+        config_file_yaml.write_text("test: config")
+
+        with (
+            patch("nemo_evaluator_launcher.api.types.hydra.initialize_config_dir"),
+            patch("nemo_evaluator_launcher.api.types.hydra.compose") as mock_compose,
+        ):
+            mock_compose.return_value = OmegaConf.create(config_dict)
+            run_cmd = RunCmd(config=str(config_file_yaml))
+            run_cmd.execute()
+            call_kwargs = mock_compose.call_args.kwargs
+            assert call_kwargs["config_name"] == "test_config"
+
+        # Test with .yml extension
+        config_file_yml = config_dir / "test_config.yml"
+        config_file_yml.write_text("test: config")
+
+        with (
+            patch("nemo_evaluator_launcher.api.types.hydra.initialize_config_dir"),
+            patch("nemo_evaluator_launcher.api.types.hydra.compose") as mock_compose,
+        ):
+            mock_compose.return_value = OmegaConf.create(config_dict)
+            run_cmd = RunCmd(config=str(config_file_yml))
+            run_cmd.execute()
+            call_kwargs = mock_compose.call_args.kwargs
+            assert call_kwargs["config_name"] == "test_config"

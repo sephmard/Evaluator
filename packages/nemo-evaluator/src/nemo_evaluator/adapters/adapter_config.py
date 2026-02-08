@@ -13,33 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Submodule responsible for the configuration related specifically to adapters.
-
-For the visibility reasons, we don't expose adapter configuration via CLI. All the
-adaptor config comes from the framework configuration yaml under
-```yaml
-target:
-  api_endpoint:
-    adapter_config:
-      discovery:
-        modules: ["mod.a.b.c", ...]
-        dirs: ["/some/path"]
-      interceptors: []
-      post_eval_hooks: []
-      endpoint_type: "chat"  # default: "chat"
-      caching_dir: "/some/dir"  # default: null
-      generate_html_report: true  # default: true
-      log_failed_requests: false  # default: false
-      tracking_requests_stats: true  # default: true
-      html_report_size: 5  # default: 5
-```
-
-This module merely takes such a dict and translates it into a typed dataclass.
-"""
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+
+from nemo_evaluator.logging import get_logger
 
 
 class DiscoveryConfig(BaseModel):
@@ -82,9 +61,122 @@ class PostEvalHookConfig(BaseModel):
         use_enum_values = True
 
 
+class LegacyAdapterConfig(BaseModel):
+    """Legacy adapter configuration parameters (pre-interceptor format).
+
+    This model validates legacy configuration dictionaries to catch typos
+    and invalid parameters early, before conversion to the new interceptor format.
+    """
+
+    class Config:
+        extra = "forbid"  # Reject any extra fields not defined here
+
+    # Boolean flags for optional features
+    use_caching: bool = Field(default=True, description="Enable caching interceptor")
+    save_responses: bool = Field(default=False, description="Save responses to disk")
+    save_requests: bool = Field(default=False, description="Save requests to disk")
+    use_system_prompt: bool = Field(
+        default=False, description="Enable system prompt modification"
+    )
+    use_omni_info: bool = Field(
+        default=False, description="Enable omni info processing"
+    )
+    use_request_logging: bool = Field(
+        default=False, description="Enable request logging"
+    )
+    use_nvcf: bool = Field(default=False, description="Enable NVCF integration")
+    use_response_logging: bool = Field(
+        default=False, description="Enable response logging"
+    )
+    use_reasoning: bool = Field(
+        default=False, description="Enable reasoning token processing"
+    )
+    process_reasoning_traces: bool = Field(
+        default=False, description="Process reasoning traces"
+    )
+    use_progress_tracking: bool = Field(
+        default=False, description="Enable progress tracking"
+    )
+    use_raise_client_errors: bool = Field(
+        default=False, description="Raise client errors"
+    )
+    include_json: bool = Field(default=True, description="Include JSON in responses")
+
+    # Model fields that are also part of AdapterConfig
+    mode: str = Field(
+        default="server", description="Adapter mode: 'server' or 'client'"
+    )
+    generate_html_report: bool = Field(default=True, description="Generate HTML report")
+    html_report_size: int | None = Field(default=5, description="HTML report size")
+    tracking_requests_stats: bool = Field(
+        default=True, description="Track request statistics"
+    )
+    log_failed_requests: bool = Field(default=False, description="Log failed requests")
+    endpoint_type: str = Field(default="chat", description="Endpoint type")
+    caching_dir: str | None = Field(default=None, description="Caching directory")
+
+    # Optional string/dict configuration parameters
+    custom_system_prompt: str | None = Field(
+        default=None, description="Custom system prompt"
+    )
+    output_dir: str | None = Field(default=None, description="Output directory")
+    params_to_add: dict[str, Any] | None = Field(
+        default=None, description="Parameters to add"
+    )
+    params_to_remove: list[str] | None = Field(
+        default=None, description="Parameters to remove"
+    )
+    params_to_rename: dict[str, str] | None = Field(
+        default=None, description="Parameters to rename"
+    )
+
+    # Optional integer limits
+    max_logged_requests: int | None = Field(
+        default=None, description="Max logged requests"
+    )
+    max_logged_responses: int | None = Field(
+        default=None, description="Max logged responses"
+    )
+    max_saved_requests: int | None = Field(
+        default=None, description="Max saved requests"
+    )
+    max_saved_responses: int | None = Field(
+        default=None, description="Max saved responses"
+    )
+
+    # Reasoning-specific parameters
+    start_reasoning_token: str | None = Field(
+        default=None, description="Start reasoning token"
+    )
+    include_if_reasoning_not_finished: bool | None = Field(
+        default=None, description="Include unfinished reasoning"
+    )
+    track_reasoning: bool | None = Field(default=None, description="Track reasoning")
+    end_reasoning_token: str = Field(
+        default="</think>", description="End reasoning token"
+    )
+
+    # Progress tracking parameters
+    progress_tracking_url: str | None = Field(
+        default=None, description="Progress tracking URL"
+    )
+    progress_tracking_interval: int = Field(
+        default=1, description="Progress tracking interval"
+    )
+
+    # Logging parameters
+    logging_aggregated_stats_interval: int = Field(
+        default=100, description="Logging aggregated stats interval"
+    )
+
+
 class AdapterConfig(BaseModel):
     """Adapter configuration with registry-based interceptor support"""
 
+    mode: str = Field(
+        description="Adapter mode: 'server' (default) or 'client'",
+        default="server",
+    )
     discovery: DiscoveryConfig = Field(
         description="Configuration for discovering 3rd party modules and directories",
         default_factory=DiscoveryConfig,
@@ -101,70 +193,10 @@ class AdapterConfig(BaseModel):
         description="Type of the endpoint to run the adapter for",
         default="chat",
     )
-    caching_dir: str | None = Field(
-        description="Directory for caching responses (legacy field)",
-        default=None,
-    )
-    generate_html_report: bool = Field(
-        description="Whether to generate HTML report (legacy field)",
-        default=True,
-    )
     log_failed_requests: bool = Field(
-        description="Whether to log failed requests (legacy field)",
+        description="Whether to log failed requests",
         default=False,
     )
-    tracking_requests_stats: bool = Field(
-        description="Whether to enable request statistics tracking. When enabled, response statistics including token usage, status codes, finish reasons, tool calls, and latency metrics will be collected and added to eval_factory_metrics.json for comprehensive evaluation analysis.",
-        default=True,
-    )
-    html_report_size: int | None = Field(
-        description="Number of request-response pairs to track in HTML report. If this is larger than max_saved_responses or max_saved_requests, it will override those values.",
-        default=5,
-    )
-
-    @classmethod
-    def get_legacy_defaults(cls) -> dict[str, Any]:
-        """Get default values for legacy configuration parameters."""
-        return {
-            "generate_html_report": cls.model_fields["generate_html_report"].default,
-            "html_report_size": cls.model_fields["html_report_size"].default,
-            "tracking_requests_stats": cls.model_fields[
-                "tracking_requests_stats"
-            ].default,
-            "log_failed_requests": cls.model_fields["log_failed_requests"].default,
-            "endpoint_type": cls.model_fields["endpoint_type"].default,
-            # Boolean defaults for optional features
-            "use_caching": True,
-            "save_responses": False,
-            "save_requests": False,
-            "use_system_prompt": False,
-            "use_omni_info": False,
-            "use_request_logging": False,
-            "use_nvcf": False,
-            "use_response_logging": False,
-            "use_reasoning": False,
-            "process_reasoning_traces": False,
-            "use_progress_tracking": False,
-            "use_raise_client_errors": False,
-            "include_json": True,
-            "custom_system_prompt": None,
-            "caching_dir": None,
-            "output_dir": None,
-            "params_to_add": None,
-            "params_to_remove": None,
-            "params_to_rename": None,
-            "max_logged_requests": None,
-            "max_logged_responses": None,
-            "max_saved_requests": None,
-            "max_saved_responses": None,
-            "start_reasoning_token": None,
-            "include_if_reasoning_not_finished": None,
-            "track_reasoning": None,
-            "end_reasoning_token": "</think>",
-            "progress_tracking_url": None,
-            "progress_tracking_interval": 1,
-            "logging_aggregated_stats_interval": 100,
-        }
 
     @classmethod
     def get_validated_config(cls, run_config: dict[str, Any]) -> "AdapterConfig":
@@ -197,6 +229,24 @@ class AdapterConfig(BaseModel):
             run_config.get("target", {}).get("api_endpoint", {}).get("adapter_config")
         )
 
+        # Validate that legacy parameters are not mixed with interceptors
+        legacy_params = set(LegacyAdapterConfig.model_fields.keys())
+        model_fields = set(cls.model_fields.keys())
+        legacy_only_params = legacy_params - model_fields
+
+        for config_name, config in [
+            ("global_adapter_config", global_cfg),
+            ("target.api_endpoint.adapter_config", local_cfg),
+        ]:
+            if config and config.get("interceptors"):
+                found_legacy = [p for p in legacy_only_params if p in config]
+                if found_legacy:
+                    raise ValueError(
+                        f"Cannot use legacy configuration parameters when interceptors are explicitly defined in {config_name}. "
+                        f"Found: {', '.join(sorted(found_legacy))}. "
+                        f"Please remove these and configure using interceptors instead."
+                    )
+
         if not global_cfg and not local_cfg:
             # Create default adapter config with caching enabled by default
             return cls.from_legacy_config({}, run_config)
@@ -227,14 +277,19 @@ class AdapterConfig(BaseModel):
                 {"name": s} if isinstance(s, str) else s
                 for s in merged["post_eval_hooks"]
             ]
+
         try:
             config = cls(**merged)
 
             # If no interceptors are configured, try to convert from legacy format
             if not config.interceptors:
+                # Pass mode through merged config so it's preserved in legacy conversion
                 config = cls.from_legacy_config(merged, run_config)
 
             return config
+        except ValidationError:
+            # Re-raise ValidationError directly for clear error messages
+            raise
         except Exception as e:
             raise ValueError(f"Invalid adapter configuration: {e}") from e
 
@@ -298,10 +353,29 @@ class AdapterConfig(BaseModel):
 
         Returns:
             AdapterConfig instance with interceptors based on legacy config
+
+        Raises:
+            ValidationError: If legacy_config contains typos or invalid field names
         """
-        # Merge legacy config with defaults to avoid repeated .get() calls
-        defaults = cls.get_legacy_defaults()
-        legacy_config = {**defaults, **legacy_config}
+        logger = get_logger(__name__)
+
+        # Validate legacy config using Pydantic model (catches typos early)
+        # Filter out modern fields (discovery, interceptors, post_eval_hooks) before validation
+        modern_fields = {"discovery", "interceptors", "post_eval_hooks"}
+        legacy_only = {k: v for k, v in legacy_config.items() if k not in modern_fields}
+
+        try:
+            validated = LegacyAdapterConfig(**legacy_only)
+            legacy_config = validated.model_dump()
+        except ValidationError:
+            # Log helpful message with list of valid fields
+            valid_fields = sorted(LegacyAdapterConfig.model_fields.keys())
+            logger.error(
+                f"Invalid legacy adapter configuration. "
+                f"Supported parameters: {', '.join(valid_fields)}"
+            )
+            # Re-raise the original ValidationError
+            raise
 
         interceptors = []
         post_eval_hooks = []
@@ -498,8 +572,6 @@ class AdapterConfig(BaseModel):
             )
 
         if legacy_config["use_reasoning"]:
-            from nemo_evaluator.logging import get_logger
-
             logger = get_logger(__name__)
             logger.warning(
                 '"use_reasoning" is deprecated as it might suggest it touches on switching on/off reasoning for mode when it does not. Use "process_reasoning_traces" instead.'
@@ -567,7 +639,6 @@ class AdapterConfig(BaseModel):
             from nemo_evaluator.adapters.interceptors.raise_client_error_interceptor import (
                 RaiseClientErrorInterceptor,
             )
-            from nemo_evaluator.logging import get_logger
 
             logger = get_logger(__name__)
 
@@ -607,14 +678,11 @@ class AdapterConfig(BaseModel):
             )
 
         return cls(
+            mode=legacy_config["mode"],
             interceptors=interceptors,
             post_eval_hooks=post_eval_hooks,
             endpoint_type=legacy_config["endpoint_type"],
-            caching_dir=legacy_config["caching_dir"],
-            generate_html_report=legacy_config["generate_html_report"],
             log_failed_requests=legacy_config["log_failed_requests"],
-            tracking_requests_stats=legacy_config["tracking_requests_stats"],
-            html_report_size=legacy_config["html_report_size"],
         )
 
     def get_interceptor_configs(self) -> dict[str, dict[str, Any]]:

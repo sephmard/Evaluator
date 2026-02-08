@@ -15,7 +15,7 @@ All paths require:
 | Task | Command |
 |------|---------|
 | List benchmarks | `nemo-evaluator-launcher ls tasks` |
-| Run evaluation | `nemo-evaluator-launcher run --config-dir packages/nemo-evaluator-launcher/examples --config-name <config>` |
+| Run evaluation | `nemo-evaluator-launcher run --config packages/nemo-evaluator-launcher/examples/<config>.yaml` |
 | Check status | `nemo-evaluator-launcher status <invocation_id>` |
 | Job info | `nemo-evaluator-launcher info <invocation_id>` |
 | Export results | `nemo-evaluator-launcher export <invocation_id> --dest local --format json` |
@@ -125,8 +125,7 @@ Save the config to a file (e.g. `phi-eval.yaml`) and launch the evaluation:
 
 ```bash
 nemo-evaluator-launcher run \
-    --config-dir . \
-    --config-name phi-eval.yaml \
+    --config ./phi-eval.yaml \
     -o execution.output_dir=./phi-results
 
 
@@ -145,21 +144,19 @@ curl -X POST "https://integrate.api.nvidia.com/v1/chat/completions" \
     -H "Authorization: Bearer $NGC_API_KEY" \
     -H "Content-Type: application/json" \
     -d '{
-        "model": "meta/llama-3.1-8b-instruct",
+        "model": "meta/llama-3.2-3b-instruct",
         "messages": [{"role": "user", "content": "Hello!"}],
         "max_tokens": 10
     }'
 
 # 2. Run a dry-run to validate configuration
 nemo-evaluator-launcher run \
-    --config-dir packages/nemo-evaluator-launcher/examples \
-    --config-name local_llama_3_1_8b_instruct \
+    --config packages/nemo-evaluator-launcher/examples/local_basic.yaml \
     --dry-run
 
 # 3. Run a minimal test with very few samples
 nemo-evaluator-launcher run \
-    --config-dir packages/nemo-evaluator-launcher/examples \
-    --config-name local_llama_3_1_8b_instruct \
+    --config packages/nemo-evaluator-launcher/examples/local_basic.yaml \
     -o +config.params.limit_samples=1 \
     -o execution.output_dir=./test_results
 ```
@@ -235,7 +232,7 @@ After completing your quickstart:
 nemo-evaluator-launcher ls tasks
 
 # Run with limited samples for quick testing
-nemo-evaluator-launcher run --config-dir packages/nemo-evaluator-launcher/examples --config-name local_limit_samples
+nemo-evaluator-launcher run --config packages/nemo-evaluator-launcher/examples/local_basic.yaml
 ```
 :::
 
@@ -263,10 +260,10 @@ nemo-evaluator-launcher export <invocation_id> --dest local --format json
 ```bash
 cd packages/nemo-evaluator-launcher
 # Run on Slurm cluster
-nemo-evaluator-launcher run --config-dir packages/nemo-evaluator-launcher/examples --config-name slurm_llama_3_1_8b_instruct
+nemo-evaluator-launcher run --config packages/nemo-evaluator-launcher/examples/slurm_vllm_basic.yaml
 
 # Run on Lepton AI
-nemo-evaluator-launcher run --config-dir packages/nemo-evaluator-launcher/examples --config-name lepton_vllm_llama_3_1_8b_instruct
+nemo-evaluator-launcher run --config packages/nemo-evaluator-launcher/examples/lepton_vllm.yaml
 ```
 :::
 

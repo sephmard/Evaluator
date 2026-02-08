@@ -62,8 +62,7 @@ Yes. Preview the full resolved configuration without executing using `--dry-run`
 
 ```bash
 nemo-evaluator-launcher run \
-  --config-dir packages/nemo-evaluator-launcher/examples \
-  --config-name local_llama_3_1_8b_instruct --dry-run
+  --config packages/nemo-evaluator-launcher/examples/local_basic.yaml --dry-run
 ```
 
 Reference: {ref}`launcher-cli-dry-run`.
@@ -220,7 +219,7 @@ execution:
 
 target:
   api_endpoint:
-    model_id: meta/llama-3.1-8b-instruct
+    model_id: meta/llama-3.2-3b-instruct
     url: https://integrate.api.nvidia.com/v1/chat/completions
     api_key_name: NGC_API_KEY
 
@@ -243,11 +242,11 @@ Yes. You can override any field in the YAML file directly from the command line 
 
 ```bash
 # Override output directory
-nemo-evaluator-launcher run --config-name your_config \
+nemo-evaluator-launcher run --config your_config.yaml \
   -o execution.output_dir=my_results
 
 # Override multiple fields
-nemo-evaluator-launcher run --config-name your_config \
+nemo-evaluator-launcher run --config your_config.yaml \
   -o target.api_endpoint.url="https://new-endpoint.com/v1/chat/completions" \
   -o target.api_endpoint.model_id=openai/gpt-4o
 ```
@@ -258,7 +257,7 @@ Overrides are merged dynamically at runtime—ideal for testing new endpoints, s
 Always start with a dry run to validate your configuration before launching a full evaluation:
 
 ```bash
-nemo-evaluator-launcher run --config-name your_config --dry-run
+nemo-evaluator-launcher run --config your_config.yaml --dry-run
 ```
 :::
 
@@ -315,9 +314,29 @@ Always test first:
 
 
 ```bash
-nemo-evaluator-launcher run --config-name your_config --dry-run
+nemo-evaluator-launcher run --config your_config.yaml --dry-run
 ```
 
 Reference: {ref}`configuration-overview`.
 
 ---
+
+## **Can I use Evaluator without internet access?**
+
+Yes. NeMo Evaluator uses datasets and model checkpoints from [Hugging Face Hub](https://huggingface.co/docs/hub/en/index). If a requested dataset or model is not available locally, it is downloaded from the Hub at runtime.
+
+When working in an environment without internet access, configure a cache directory and pre-populate it with all required data before launching the evaluation.
+
+See the [example configuration](https://github.com/NVIDIA-NeMo/Evaluator/blob/main/packages/nemo-evaluator-launcher/examples/slurm_vllm_advanced_hf_caching.yaml) with HF caching:
+
+```{literalinclude} ../../packages/nemo-evaluator-launcher/examples/slurm_vllm_advanced_hf_caching.yaml
+:language: yaml
+:start-after: "# [docs-start-snippet]"
+:end-before: "# [docs-end-snippet]"
+```
+
+Modify the example with actual paths for the mounts and run:
+
+```bash
+nemo-evaluator-launcher run --config packages/nemo-evaluator-launcher/examples/slurm_vllm_advanced_hf_caching.yaml
+```

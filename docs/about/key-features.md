@@ -17,9 +17,9 @@ Run evaluations anywhere with unified configuration and monitoring:
 
 ```bash
 # Single command, multiple backends
-nemo-evaluator-launcher run --config-dir packages/nemo-evaluator-launcher/examples --config-name local_llama_3_1_8b_instruct
-nemo-evaluator-launcher run --config-dir packages/nemo-evaluator-launcher/examples --config-name slurm_llama_3_1_8b_instruct
-nemo-evaluator-launcher run --config-dir packages/nemo-evaluator-launcher/examples --config-name lepton_vllm_llama_3_1_8b_instruct
+nemo-evaluator-launcher run --config packages/nemo-evaluator-launcher/examples/local_basic.yaml
+nemo-evaluator-launcher run --config packages/nemo-evaluator-launcher/examples/slurm_vllm_basic.yaml
+nemo-evaluator-launcher run --config packages/nemo-evaluator-launcher/examples/lepton_basic.yaml
 ```
 
 ### Evaluation Benchmarks & Tasks
@@ -30,12 +30,7 @@ Access comprehensive benchmark suite with single CLI:
 nemo-evaluator-launcher ls tasks
 
 # Run academic benchmarks
-nemo-evaluator-launcher run --config-dir packages/nemo-evaluator-launcher/examples --config-name local_llama_3_1_8b_instruct \
-  -o 'evaluation.tasks=["mmlu_pro", "gsm8k", "arc_challenge"]'
-
-# Run safety evaluation
-nemo-evaluator-launcher run --config-dir packages/nemo-evaluator-launcher/examples --config-name local_llama_3_1_8b_instruct \
-  -o 'evaluation.tasks=["aegis_v2", "garak"]'
+nemo-evaluator-launcher run --config packages/nemo-evaluator-launcher/examples/local_basic.yaml
 ```
 
 ### Built-in Result Export
@@ -56,9 +51,6 @@ nemo-evaluator-launcher export <invocation_id> --dest gsheets
 
 ### Container-First Architecture
 Pre-built NGC containers guarantee reproducible results across environments:
-
-```{include} ../_resources/tasks-table.md
-```
 
 ```bash
 # Pull and run any evaluation container
@@ -93,9 +85,9 @@ target:
             cache_dir: "./evaluation_cache"
 
         # Communication with http://localhost:8080/v1/completions/
-        -name: endpoint
+        - name: endpoint
 
-        # Reasoning interceptor
+        # Processing of reasoning traces
         - name: reasoning
           config:
             start_reasoning_token: "<think>"
@@ -131,16 +123,16 @@ Direct access to specialized evaluation containers through [NGC Catalog](https:/
 
 ```bash
 # Academic benchmarks
-docker run --rm -it --gpus all nvcr.io/nvidia/eval-factory/simple-evals:{{ docker_compose_latest }}
+docker run --rm -it nvcr.io/nvidia/eval-factory/simple-evals:{{ docker_compose_latest }}
 
 # Code generation evaluation
-docker run --rm -it --gpus all nvcr.io/nvidia/eval-factory/bigcode-evaluation-harness:{{ docker_compose_latest }}
+docker run --rm -it nvcr.io/nvidia/eval-factory/bigcode-evaluation-harness:{{ docker_compose_latest }}
 
 # Safety and security testing
-docker run --rm -it --gpus all nvcr.io/nvidia/eval-factory/safety-harness:{{ docker_compose_latest }}
+docker run --rm -it nvcr.io/nvidia/eval-factory/safety-harness:{{ docker_compose_latest }}
 
 # Vision-language model evaluation
-docker run --rm -it --gpus all nvcr.io/nvidia/eval-factory/vlmevalkit:{{ docker_compose_latest }}
+docker run --rm -it nvcr.io/nvidia/eval-factory/vlmevalkit:{{ docker_compose_latest }}
 ```
 
 ### Reproducible Evaluation Environments
@@ -309,17 +301,19 @@ target:
 Built-in safety assessment through specialized containers:
 
 ```bash
-# Run safety evaluation suite
+# Run Aegis and Garak evaluations
+export JUDGE_API_KEY=your-judge-api-key  # token with access to your judge endpoint
+export HF_TOKEN_FOR_AEGIS_V2=hf_your-token  # HF token with access to the gated Aegis dataset and meta-llama/Llama-3.1-8B-Instruct
+export NGC_API_KEY=nvapi-your-key  # token with access to build.com
+
+# set judge.url in the config or pass with -o
 nemo-evaluator-launcher run \
-    --config-dir packages/nemo-evaluator-launcher/examples \
-    --config-name local_llama_3_1_8b_instruct \
-    -o 'evaluation.tasks=["aegis_v2", "garak"]'
+    --config packages/nemo-evaluator-launcher/examples/local_safety.yaml \
 ```
 
 **Safety Containers Available:**
 - **safety-harness**: Content safety evaluation using NemoGuard judge models
 - **garak**: Security vulnerability scanning and prompt injection detection
-- **agentic_eval**: Tool usage and planning evaluation for agentic AI systems
 
 ##  **Monitoring and Observability**
 

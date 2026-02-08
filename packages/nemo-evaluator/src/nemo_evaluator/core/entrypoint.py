@@ -22,7 +22,6 @@ import yaml
 
 # Import logging to ensure centralized logging is configured
 from nemo_evaluator import logging  # noqa: F401
-from nemo_evaluator.adapters.adapter_config import AdapterConfig
 from nemo_evaluator.api.api_dataclasses import (
     EvaluationConfig,
     EvaluationMetadata,
@@ -31,15 +30,18 @@ from nemo_evaluator.api.api_dataclasses import (
 from nemo_evaluator.core.evaluate import evaluate
 from nemo_evaluator.core.input import (
     _get_framework_evaluations,
+    _is_internal_package_installed,
+    _parse_cli_args,
     load_run_config,
-    parse_cli_args,
     validate_configuration,
 )
+
+__all__ = []
 
 from .utils import deep_update
 
 
-def get_args() -> argparse.Namespace:
+def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--debug", action="store_true", help="Debug the core_evals script"
@@ -86,6 +88,11 @@ def get_args() -> argparse.Namespace:
         default=False,
     )
     parser_run.set_defaults(command="run_eval")
+    return parser
+
+
+def get_args() -> argparse.Namespace:
+    parser = get_parser()
 
     args = parser.parse_args()
 
@@ -107,6 +114,19 @@ def get_args() -> argparse.Namespace:
 
 
 def show_available_tasks() -> None:
+    """
+    Prints all available evaluations in the format of::
+
+        {harness1}:
+            * benchmark A
+            * benchmark B
+        {harness2}:
+            * benchmark A
+            * benchmark B
+        ...
+
+    .. important:: Only evaluations from installed wheels are being displayed.
+    """
     try:
         import core_evals
 
@@ -117,11 +137,16 @@ def show_available_tasks() -> None:
     if not core_evals_pkg:
         print("NO evaluation packages are installed.")
 
+    include_internal = _is_internal_package_installed()
     for pkg in core_evals_pkg:
         framework_eval_mapping, *_ = _get_framework_evaluations(
-            os.path.join(pkg.module_finder.path, pkg.name, "framework.yml")
+            os.path.join(pkg.module_finder.path, pkg.name, "framework.yml"),
+            include_internal=include_internal,
         )
         for ind_pkg in framework_eval_mapping.keys():
+            # Empty task mapping means harness has no public tasks.
+            if not framework_eval_mapping[ind_pkg]:
+                continue
             print(f"{ind_pkg}: ")
             for task in framework_eval_mapping[ind_pkg].keys():
                 print(f"  * {task}")
@@ -130,7 +155,7 @@ def show_available_tasks() -> None:
 def run(args) -> None:
     run_config = load_run_config(args.run_config) if args.run_config else {}
     # CLI args take precedence over YAML run config
-    run_config = deep_update(run_config, parse_cli_args(args), skip_nones=True)
+    run_config = deep_update(run_config, _parse_cli_args(args), skip_nones=True)
     if args.dry_run:
         evaluation = validate_configuration(run_config)
         print("Rendered config:\n")
@@ -142,10 +167,12 @@ def run(args) -> None:
         exit(0)
 
     metadata_cfg: EvaluationMetadata | None = run_config.get("metadata")
-    adapter_config = AdapterConfig.get_validated_config(run_config)
-    eval_cfg = EvaluationConfig(**run_config["config"])
-    target_cfg = EvaluationTarget(**run_config["target"])
-    target_cfg.api_endpoint.adapter_config = adapter_config
+
+    # Build evaluation configuration with framework defaults merged
+    evaluation = validate_configuration(run_config)
+
+    eval_cfg = EvaluationConfig(**evaluation.model_dump()["config"])
+    target_cfg = EvaluationTarget(**evaluation.model_dump()["target"])
 
     evaluate(eval_cfg=eval_cfg, target_cfg=target_cfg, metadata=metadata_cfg)
 

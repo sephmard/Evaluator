@@ -21,10 +21,15 @@ The launcher supports multiple deployment backends and execution environments.
 
 ```bash
 # Deploy model and run evaluation in one command (Slurm example)
+HOSTNAME=cluster-login-node.com
+ACCOUNT=my_account
+OUT_DIR=/absolute/path/on/login/node
+
 nemo-evaluator-launcher run \
-    --config-dir packages/nemo-evaluator-launcher/examples \
-    --config-name slurm_llama_3_1_8b_instruct \
-    -o deployment.checkpoint_path=/path/to/your/model
+    -o execution.hostname=$HOSTNAME \
+    -o execution.account=$ACCOUNT \
+    -o execution.output_dir=$OUT_DIR \
+    --config packages/nemo-evaluator-launcher/examples/slurm_vllm_basic.yaml
 ```
 
 ## Execution Backends

@@ -14,8 +14,8 @@
 # limitations under the License.
 #
 import base64
-import copy
 import datetime
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -24,6 +24,8 @@ from omegaconf import DictConfig, OmegaConf
 
 from nemo_evaluator_launcher.cli.version import get_versions
 from nemo_evaluator_launcher.common.logging_utils import logger
+
+CONTAINER_RESULTS_DIR = "/results"
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,47 @@ def _set_nested_optionally_overriding(
         temp[keys[-1]] = val
 
 
+_MIGRATION_MESSAGE = """
+`overrides` field is no longer supported. Use `nemo_evaluator_config` field instead, e.g.:
+
+1. If you are using overrides in your yaml config, replace:
+
+```yaml
+evaluation:
+  overrides:
+    config.params.temperature: 0.6
+    config.params.top_p: 0.95
+```
+
+with:
+
+```yaml
+evaluation:
+  nemo_evaluator_config:
+    config:
+      params:
+        temperature: 0.6
+        top_p: 0.95
+```
+
+2. If you are using overrides in your cli command, replace:
+
+```bash
+nemo-evaluator-launcher run --config my_config.yaml \\
+    -o evaluation.overrides.config.params.temperature=0.6 \\
+    -o evaluation.overrides.config.params.top_p=0.95
+```
+
+with:
+
+```bash
+nemo-evaluator-launcher run --config my_config.yaml \\
+    -o evaluation.nemo_evaluator_config.config.params.temperature=0.6 \\
+    -o evaluation.nemo_evaluator_config.config.params.top_p=0.95
+```
+"""
+
+
 def get_eval_factory_config(
     cfg: DictConfig,
     user_task_config: DictConfig,
@@ -79,17 +122,11 @@ def get_eval_factory_config(
 
     This function extracts the config field similar to how overrides are handled.
 
-    Overrides will start to be deprecated (or not, but at least a warning will be logged).
+    It applies task-level overrides to the global overrides.
     """
 
     if cfg.evaluation.get("overrides") or user_task_config.get("overrides"):
-        # TODO(agronskiy): start removing overrides, test `test_start_deprecating_overrides`
-        # will start failing soon.
-        logger.warning(
-            "We are deprecating using old-style dot-delimited overrides "
-            "in favour of `nemo_evaluator_config` field. Please check "
-            "the documentation."
-        )
+        raise ValueError(_MIGRATION_MESSAGE)
 
     logger.debug("Getting nemo evaluator merged config")
     # Extract config fields similar to overrides - convert to basic Python types first
@@ -153,16 +190,29 @@ def get_eval_factory_command(
         ["target", "api_endpoint", "type"],
         task_definition["endpoint_type"],
     )
+    # For unlisted tasks, use the full harness.task format
+    # For listed tasks, use just the task name (existing behavior)
+    if task_definition.get("is_unlisted"):
+        harness = task_definition.get("harness", "")
+        task = task_definition.get("task", "")
+        if harness:
+            task_type = f"{harness}.{task}"
+        else:
+            task_type = task
+    else:
+        task_type = task_definition["task"]
+
     _set_nested_optionally_overriding(
         merged_nemo_evaluator_config,
         ["config", "type"],
-        task_definition["task"],
+        task_type,
     )
     _set_nested_optionally_overriding(
         merged_nemo_evaluator_config,
         ["config", "output_dir"],
-        "/results",
+        CONTAINER_RESULTS_DIR,
     )
+    # FIXME(martas): update to api_key_name after 25.12 is released
     _set_nested_optionally_overriding(
         merged_nemo_evaluator_config,
         ["target", "api_endpoint", "api_key"],
@@ -202,11 +252,28 @@ def get_eval_factory_command(
             pre_cmd,
         )
 
+    commands = []
+    debug = []
+
     create_pre_script_cmd = _str_to_echo_command(pre_cmd, filename="pre_cmd.sh")
+    commands.append(create_pre_script_cmd.cmd)
+    debug.append(create_pre_script_cmd.debug)
 
     create_yaml_cmd = _str_to_echo_command(
         yaml.safe_dump(merged_nemo_evaluator_config), "config_ef.yaml"
     )
+    commands.append(create_yaml_cmd.cmd)
+    debug.append(create_yaml_cmd.debug)
+
+    # Store the original unresolved config if available
+    config_path = cfg.get("user_config_path", None)
+    if config_path:
+        create_unresolved_config_cmd = _str_to_echo_command(
+            open(config_path, "r").read(),
+            filename=f"{CONTAINER_RESULTS_DIR}/launcher_unresolved_config.yaml",
+        )
+        commands.append(create_unresolved_config_cmd.cmd)
+        debug.append(create_unresolved_config_cmd.debug)
 
     # NOTE: we use `source` to allow tricks like exports etc (if needed) -- it runs in the same
     # shell as the command.
@@ -216,27 +283,13 @@ def get_eval_factory_command(
         + "&& $cmd run_eval --run_config config_ef.yaml"
     )
 
-    # NOTE: see note and test about deprecating that.
-    overrides = copy.deepcopy(dict(cfg.evaluation.get("overrides", {})))
-    overrides.update(dict(user_task_config.get("overrides", {})))
-    # NOTE(dfridman): Temporary fix to make sure that the overrides arg is not split into multiple lines.
-    # Consider passing a JSON object on Eval Factory side
-    overrides = {
-        k: (v.strip("\n") if isinstance(v, str) else v) for k, v in overrides.items()
-    }
-    overrides_str = ",".join([f"{k}={v}" for k, v in overrides.items()])
-    if overrides_str:
-        eval_command = f"{eval_command} --overrides {overrides_str}"
+    commands.append(eval_command)
 
     # We return both the command and the debugging base64-decoded strings, useful
     # for exposing when building scripts.
     return CmdAndReadableComment(
-        cmd=create_pre_script_cmd.cmd
-        + " && "
-        + create_yaml_cmd.cmd
-        + " && "
-        + eval_command,
-        debug=create_pre_script_cmd.debug + "\n\n" + create_yaml_cmd.debug,
+        cmd=" && ".join(commands),
+        debug="\n\n".join(debug),
         is_potentially_unsafe=is_potentially_unsafe,
     )
 
@@ -256,13 +309,6 @@ def get_endpoint_url(
 
         if nemo_evaluator_config_url:
             return nemo_evaluator_config_url
-
-        # Being deprecated, see `get_eval_factory_config` message.
-        overrides_old_style_url = merged_nemo_evaluator_config.get("overrides", {}).get(
-            "target.api_endpoint.url", None
-        )
-        if overrides_old_style_url:
-            return overrides_old_style_url
 
         return url
 
@@ -287,7 +333,15 @@ def get_endpoint_url(
     else:
         # Local executor - use localhost
         endpoint_uri = cfg.deployment.endpoints[endpoint_type]
-        endpoint_url = f"http://127.0.0.1:{cfg.deployment.port}{endpoint_uri}"
+
+        # Use HAProxy port if multiple_instances is enabled
+        if cfg.deployment.get("multiple_instances", False):
+            proxy_config = cfg.execution.get("proxy", {}).get("config", {})
+            port = proxy_config.get("haproxy_port", 5009)
+        else:
+            port = cfg.deployment.port
+
+        endpoint_url = f"http://127.0.0.1:{port}{endpoint_uri}"
         return endpoint_url
 
 
@@ -364,3 +418,56 @@ def get_eval_factory_dataset_size_from_run_config(run_config: dict) -> Optional[
     n_samples = int(config["params"].get("extra", {}).get("n_samples", 1))
     dataset_size *= n_samples
     return dataset_size
+
+
+def check_unlisted_tasks_safeguard(
+    unlisted_task_names: list[str],
+    dry_run: bool,
+) -> None:
+    """Check and enforce safeguard for unlisted tasks.
+
+    Unlisted tasks are those not defined in the Framework Definition Files (FDF).
+    This follows the same pattern as the NEMO_EVALUATOR_TRUST_PRE_CMD safeguard.
+
+    Args:
+        unlisted_task_names: List of task names that are unlisted (not in FDF).
+        dry_run: Whether this is a dry-run execution.
+
+    Raises:
+        AttributeError: If unlisted tasks present and trust flag not set (non-dry-run only).
+    """
+    if not unlisted_task_names:
+        return
+
+    from nemo_evaluator_launcher.common.printing_utils import red
+
+    warning_msg = (
+        f"Found {len(unlisted_task_names)} unlisted task(s) not in FDF mapping: "
+        f"{', '.join(unlisted_task_names)}. "
+    )
+
+    if dry_run:
+        print(
+            red(
+                f"\n{warning_msg}"
+                "When running without --dry-run, set NEMO_EVALUATOR_TRUST_UNLISTED_TASKS=1 "
+                "if you trust these tasks."
+            )
+        )
+        return
+
+    if os.environ.get("NEMO_EVALUATOR_TRUST_UNLISTED_TASKS", "") == "1":
+        logger.warning(
+            warning_msg
+            + "NEMO_EVALUATOR_TRUST_UNLISTED_TASKS is set, proceeding with caution.",
+            unlisted_tasks=unlisted_task_names,
+        )
+    else:
+        logger.error(
+            warning_msg + "Set NEMO_EVALUATOR_TRUST_UNLISTED_TASKS=1 to proceed.",
+            unlisted_tasks=unlisted_task_names,
+        )
+        raise AttributeError(
+            f"Unlisted tasks found: {', '.join(unlisted_task_names)}. "
+            "Set NEMO_EVALUATOR_TRUST_UNLISTED_TASKS=1 to proceed."
+        )

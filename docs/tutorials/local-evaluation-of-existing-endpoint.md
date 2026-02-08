@@ -42,7 +42,7 @@ Deploy an OpenAI-compatible endpoint using frameworks like vLLM, SGLang, TRT-LLM
 <!-- Refer to {ref}`bring-your-own-endpoint-manual` for deployment guidance -->
 
 :::{note}
-For this tutorial, we will use `meta/llama-3.1-8b-instruct` from [build.nvidia.com](https://build.nvidia.com/meta/llama-3_1-8b-instruct). You will need to export your `NGC_API_KEY` to access this endpoint.
+For this tutorial, we will use `meta/llama-3.2-3b-instruct` from [build.nvidia.com](https://build.nvidia.com/meta/llama-3_1-8b-instruct). You will need to export your `NGC_API_KEY` to access this endpoint.
 :::
 
 ### 2. Select Tasks
@@ -84,7 +84,7 @@ execution:
 
 target:
   api_endpoint:
-    model_id: meta/llama-3.1-8b-instruct  # TODO: update to the model you want to evaluate
+    model_id: meta/llama-3.2-3b-instruct  # TODO: update to the model you want to evaluate
     url: https://integrate.api.nvidia.com/v1/chat/completions  # TODO: update to the endpoint you want to evaluate
     api_key_name: NGC_API_KEY  # Name of the env variable that stores the API Key with access to build.nvidia.com (or model of your choice)
 
@@ -112,7 +112,7 @@ This configuration will create evaluations for 2 tasks: `ifeval` and `humaneval_
 You can display the whole configuration and scripts which will be executed using `--dry-run`:
 
 ```
-nemo-evaluator-launcher run --config-dir configs --config-name local_endpoint --dry-run
+nemo-evaluator-launcher run --config configs/local_endpoint.yaml --dry-run
 ```
 
 ### 4. Run the Evaluation
@@ -120,7 +120,7 @@ nemo-evaluator-launcher run --config-dir configs --config-name local_endpoint --
 Once your configuration file is complete, you can run the evaluations:
 
 ```bash
-nemo-evaluator-launcher run --config-dir configs --config-name local_endpoint
+nemo-evaluator-launcher run --config configs/local_endpoint.yaml
 ```
 
 ### 5. Run the Same Evaluation for a Different Model (Using CLI Overrides)
@@ -131,7 +131,7 @@ export API_KEY=<YOUR MODEL API KEY>
 MODEL_NAME=<YOUR_MODEL_NAME>
 URL=<YOUR_ENDPOINT_URL>  # Note: endpoint URL needs to be FULL (e.g., https://api.example.com/v1/chat/completions)
 
-nemo-evaluator-launcher run --config-dir configs --config-name local_endpoint \
+nemo-evaluator-launcher run --config configs/local_endpoint.yaml \
   -o target.api_endpoint.model_id=$MODEL_NAME \
   -o target.api_endpoint.url=$URL \
   -o target.api_endpoint.api_key_name=API_KEY

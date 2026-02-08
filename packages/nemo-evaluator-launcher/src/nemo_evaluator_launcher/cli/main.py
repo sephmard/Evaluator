@@ -22,7 +22,9 @@ from simple_parsing import ArgumentParser
 import nemo_evaluator_launcher.cli.export as export
 import nemo_evaluator_launcher.cli.info as info
 import nemo_evaluator_launcher.cli.kill as kill
+import nemo_evaluator_launcher.cli.logs as logs
 import nemo_evaluator_launcher.cli.ls_runs as ls_runs
+import nemo_evaluator_launcher.cli.ls_task as ls_task
 import nemo_evaluator_launcher.cli.ls_tasks as ls_tasks
 import nemo_evaluator_launcher.cli.run as run
 import nemo_evaluator_launcher.cli.status as status
@@ -42,11 +44,13 @@ def is_verbose_enabled(args) -> bool:
     subcommands = [
         "run",
         "status",
+        "logs",
         "info",
         "kill",
         "tasks_alias",
         "tasks",
         "runs",
+        "task",
         "export",
     ]
     for subcmd in subcommands:
@@ -106,6 +110,14 @@ def create_parser() -> ArgumentParser:
     )
     status_parser.add_arguments(status.Cmd, dest="status")
 
+    # Logs subcommand
+    logs_parser = subparsers.add_parser(
+        "logs",
+        help="Stream logs from evaluation jobs",
+        description="Stream logs from evaluation jobs by invocation ID or job ID",
+    )
+    logs_parser.add_arguments(logs.Cmd, dest="logs")
+
     # Kill subcommand
     kill_parser = subparsers.add_parser(
         "kill",
@@ -148,6 +160,14 @@ def create_parser() -> ArgumentParser:
         description="Show a concise table of invocations from the exec DB",
     )
     ls_runs_parser.add_arguments(ls_runs.Cmd, dest="runs")
+
+    # ls task (task details)
+    ls_task_parser = ls_sub.add_parser(
+        "task",
+        help="Show task details",
+        description="Show detailed information about a specific task",
+    )
+    ls_task_parser.add_arguments(ls_task.Cmd, dest="task")
 
     # Export subcommand
     export_parser = subparsers.add_parser(
@@ -204,16 +224,23 @@ def main() -> None:
         args.run.execute()
     elif args.command == "status":
         args.status.execute()
+    elif args.command == "logs":
+        args.logs.execute()
     elif args.command == "kill":
         args.kill.execute()
     elif args.command == "ls":
         # Dispatch nested ls subcommands
-        if args.ls_command is None or args.ls_command == "tasks":
-            # Default to tasks when no subcommand specified
+        if args.ls_command == "tasks":
+            # When explicitly "ls tasks", use args.tasks (has correct from_container)
+            args.tasks.execute()
+        elif args.ls_command is None:
+            # When just "ls" (no subcommand), use args.tasks_alias
             if hasattr(args, "tasks_alias"):
                 args.tasks_alias.execute()
             else:
                 args.tasks.execute()
+        elif args.ls_command == "task":
+            args.task.execute()
         elif args.ls_command == "runs":
             args.runs.execute()
     elif args.command == "export":

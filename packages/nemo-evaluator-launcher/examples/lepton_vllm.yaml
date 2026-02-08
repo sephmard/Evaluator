@@ -1,0 +1,145 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# How to use: copy this file locally into a directory, say `examples`, and run
+# Run this config with `nemo-evaluator-launcher run --config examples/lepton_vllm.yaml`.
+
+# This example shows how to use Lepton as an execution platform with vLLM.
+# Execution flow:
+# 1. Deploy the specified vLLM model to a Lepton endpoint
+# 2. Wait for the endpoint to be ready
+# 3. Run evaluation tasks as parallel Lepton jobs that connect to the deployed vLLM model
+# 4. Clean up the endpoint when done (on failure) or remind you to clean up (on success)
+
+# Prerequisites:
+# 1. Configure your Lepton credentials: lep login
+# 2. Have HuggingFace token configured for model access (UI/settings/secrets, Hugging Face)
+# 3. Have ENDPOINT_API_KEY configured for the endpoint (UI/settings/secrets, Custom Secret)
+# 4. Configure storage paths in UI/Utilities/Storage and update the paths in this config
+
+# Monitoring:
+# Once the deployment is ready, you can monitor it in the Lepton UI:
+# - Deployment status: UI/Endpoints
+# - Evaluation jobs: UI/Batch Jobs
+
+name: lepton_vllm_llama_3_1_8b_instruct
+
+defaults:
+  - execution: lepton/default
+  - deployment: vllm
+  - _self_
+
+# =============================================================================
+# EXECUTION CONFIGURATION
+# =============================================================================
+execution:
+  output_dir: lepton_vllm_llama_3_1_8b_results
+
+  # Optional: Override evaluation task execution settings
+  evaluation_tasks:
+    # resource_shape: "gpu.small"  # Override default CPU with GPU for tasks (Optional)
+    timeout: 3600  # Override default 3600 timeout (this is how long we wait for the endpoint to be ready)
+
+  lepton_platform:
+    deployment:
+      # TODO: Override the default node group for endpoint deployments after gpu specification e.g. h200-01 it should have node id , see UI/Nodes
+      node_group: "nv-int-multiteam-nebius-h200-01-mjgbgffo"
+
+      platform_defaults:
+        image_pull_secrets:
+          # TODO: can be created in UI/settings/Registries, this secret will be used for the deployment image pull, it should give access for pulling vLLM images
+          - "lepton-nvidia"
+
+    tasks:
+      api_tokens:
+        - value_from:
+            token_name_ref: "ENDPOINT_API_KEY"
+
+      env_vars:
+        HF_TOKEN:
+          value_from:
+            # TODO: the name of a HF secret created via UI/settings/secrets
+            secret_name_ref: "HUGGING_FACE_HUB_TOKEN"
+        API_KEY:
+          value_from:
+            # TODO: the name of a secret created via UI/settings/secrets (custom secret), API key for your lepton deployed endpoint
+            secret_name_ref: "ENDPOINT_API_KEY"
+
+      # Node group for evaluation tasks
+      node_group: "nv-int-multiteam-nebius-h200-01"
+      # Storage mounts for task execution
+      mounts:
+        # Main workspace mount
+        - from: "node-nfs:lepton-shared-fs"
+          path: "/EU-Model-Builder-SAs/user_homes/${oc.env:USER}/nemo-evaluator-launcher-workspace" # TODO: set it to your lepton storage path (see UI/Utilities/Storage)
+          mount_path: "/workspace"
+
+# =============================================================================
+# DEPLOYMENT CONFIGURATION (vLLM-specific)
+# =============================================================================
+deployment:
+  # vLLM model configuration
+  checkpoint_path: meta-llama/Llama-3.1-8B-Instruct # HuggingFace model ID
+  served_model_name: llama-3.1-8b-instruct
+
+  # vLLM-specific performance settings
+  tensor_parallel_size: 1 # Adjust based on GPU memory
+  pipeline_parallel_size: 1
+  data_parallel_size: 1
+  extra_args: "--gpu-memory-utilization 0.95 --trust-remote-code"
+
+  # Lepton-specific deployment settings
+  lepton_config:
+    endpoint_name: llama-3-1-8b  # Base name for Lepton endpoint
+    resource_shape: gpu.1xh200 # GPU shape for the endpoint, it means 1 H200 GPU, for the deployment which requires more you can use e.g. gpu.2xh200
+    min_replicas: 1
+    max_replicas: 3
+
+    api_tokens:
+      - value_from:
+          token_name_ref: "ENDPOINT_API_KEY"
+
+    # Auto-scaling settings
+    auto_scaler:
+      scale_down:
+        no_traffic_timeout: 3600
+        scale_from_zero: false
+
+    # Environment variables for vLLM container
+    envs:
+      # Secret references (recommended for sensitive data)
+      HF_TOKEN:
+        value_from:
+          secret_name_ref: "HUGGING_FACE_HUB_TOKEN"
+
+      # Additional deployment-derived environment variables are auto-populated:
+      # - SERVED_MODEL_NAME: llama-3.1-8b-instruct (from deployment.served_model_name)
+      # - MODEL_PATH: meta-llama/Llama-3.1-8B-Instruct (from deployment.checkpoint_path)
+      # - TENSOR_PARALLEL_SIZE: 1 (from deployment.tensor_parallel_size)
+      # - MODEL_PORT: 8000 (from deployment.port)
+
+    # Storage mounts for model caching
+    mounts:
+      enabled: true
+      cache_path: "/EU-Model-Builder-SAs/user_homes/${oc.env:USER}/llama-3.1-8b-instruct" # TODO: set it to your lepton storage path (see UI/Utilities/Storage)
+      mount_path: "/opt/nim/.cache"
+
+# =============================================================================
+# EVALUATION CONFIGURATION
+# =============================================================================
+evaluation:
+  # Evaluation tasks to run
+  tasks:
+    - name: lm-evaluation-harness.ifeval

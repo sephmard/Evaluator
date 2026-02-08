@@ -31,10 +31,13 @@ from nemo_evaluator_launcher.common.execdb import (
     generate_invocation_id,
     generate_job_id,
 )
-from nemo_evaluator_launcher.common.helpers import get_eval_factory_command
+from nemo_evaluator_launcher.common.helpers import (
+    check_unlisted_tasks_safeguard,
+    get_eval_factory_command,
+)
 from nemo_evaluator_launcher.common.logging_utils import logger
 from nemo_evaluator_launcher.common.mapping import (
-    get_task_from_mapping,
+    get_task_definition_for_job,
     load_tasks_mapping,
 )
 from nemo_evaluator_launcher.common.printing_utils import red
@@ -96,11 +99,26 @@ class LeptonExecutor(BaseExecutor):
         # populated.
         # Refactor the whole thing.
         is_potentially_unsafe = False
+        unlisted_task_names: list[str] = []
         for idx, task in enumerate(cfg.evaluation.tasks):
             pre_cmd: str = task.get("pre_cmd") or cfg.evaluation.get("pre_cmd") or ""
             if pre_cmd:
                 is_potentially_unsafe = True
-                break
+
+            # Track unlisted tasks for safeguard check
+            task_definition = get_task_definition_for_job(
+                task_query=task.name,
+                base_mapping=tasks_mapping,
+                container=task.get("container"),
+                endpoint_type=task.get("endpoint_type"),
+            )
+            if task_definition.get("is_unlisted", False):
+                unlisted_task_names.append(task.name)
+
+        # Check for deployment pre_cmd
+        deployment_pre_cmd: str = cfg.deployment.get("pre_cmd") or ""
+        if deployment_pre_cmd:
+            is_potentially_unsafe = True
 
         # DRY-RUN mode
         if dry_run:
@@ -119,23 +137,29 @@ class LeptonExecutor(BaseExecutor):
             if is_potentially_unsafe:
                 print(
                     red(
-                        "\nFound `pre_cmd` which carries security risk. When running without --dry-run "
+                        "\nFound `pre_cmd` (evaluation or deployment) which carries security risk. When running without --dry-run "
                         "make sure you trust the command and set NEMO_EVALUATOR_TRUST_PRE_CMD=1"
                     )
                 )
 
+            # Check unlisted tasks safeguard (prints warning in dry-run)
+            check_unlisted_tasks_safeguard(unlisted_task_names, dry_run=True)
+
             return invocation_id
+
+        # Check unlisted tasks safeguard (raises error if flag not set)
+        check_unlisted_tasks_safeguard(unlisted_task_names, dry_run=False)
 
         if is_potentially_unsafe:
             if os.environ.get("NEMO_EVALUATOR_TRUST_PRE_CMD", "") == "1":
                 logger.warning(
-                    "Found non-empty task commands (e.g. `pre_cmd`) and NEMO_EVALUATOR_TRUST_PRE_CMD "
+                    "Found non-empty commands (e.g. `pre_cmd` in evaluation or deployment) and NEMO_EVALUATOR_TRUST_PRE_CMD "
                     "is set, proceeding with caution."
                 )
 
             else:
                 logger.error(
-                    "Found non-empty task commands (e.g. `pre_cmd`) and NEMO_EVALUATOR_TRUST_PRE_CMD "
+                    "Found non-empty commands (e.g. `pre_cmd` in evaluation or deployment) and NEMO_EVALUATOR_TRUST_PRE_CMD "
                     "is not set. This might carry security risk and unstable environments. "
                     "To continue, make sure you trust the command and set NEMO_EVALUATOR_TRUST_PRE_CMD=1.",
                 )
@@ -288,8 +312,10 @@ class LeptonExecutor(BaseExecutor):
                             return
 
                         # Construct the full endpoint URL
-                        task_definition = get_task_from_mapping(
-                            task.name, tasks_mapping
+                        task_definition = get_task_definition_for_job(
+                            task_query=task.name,
+                            base_mapping=tasks_mapping,
+                            container=task.get("container"),
                         )
                         task_endpoint_type = task_definition["endpoint_type"]
                         endpoint_path = cfg.deployment.endpoints[task_endpoint_type]
@@ -378,7 +404,11 @@ class LeptonExecutor(BaseExecutor):
 
             # Submit each evaluation task as a Lepton job
             for idx, task in enumerate(cfg.evaluation.tasks):
-                task_definition = get_task_from_mapping(task.name, tasks_mapping)
+                task_definition = get_task_definition_for_job(
+                    task_query=task.name,
+                    base_mapping=tasks_mapping,
+                    container=task.get("container"),
+                )
 
                 # Create job ID and Lepton job name (max 36 chars)
                 job_id = generate_job_id(invocation_id, idx)
@@ -530,6 +560,33 @@ class LeptonExecutor(BaseExecutor):
                         )
 
                     job_mounts.append(mount_dict)
+
+                # Handle dataset directory mounting if NEMO_EVALUATOR_DATASET_DIR is required
+                if "NEMO_EVALUATOR_DATASET_DIR" in task_definition.get(
+                    "required_env_vars", []
+                ):
+                    # Get dataset directory from task config
+                    if "dataset_dir" in task:
+                        dataset_mount_host = task["dataset_dir"]
+                    else:
+                        raise ValueError(
+                            f"{task.name} task requires a dataset_dir to be specified. "
+                            f"Add 'dataset_dir: /path/to/your/dataset' under the task configuration."
+                        )
+                    # Get container mount path (default to /datasets if not specified)
+                    dataset_mount_container = task.get(
+                        "dataset_mount_path", "/datasets"
+                    )
+                    # Add dataset mount to job mounts
+                    # Lepton mount format: {"path": "/path/in/container", "mount_from": {"path": "/host/path"}}
+                    job_mounts.append(
+                        {
+                            "path": dataset_mount_container,
+                            "mount_from": {"path": dataset_mount_host},
+                        }
+                    )
+                    # Add NEMO_EVALUATOR_DATASET_DIR environment variable
+                    job_env_vars["NEMO_EVALUATOR_DATASET_DIR"] = dataset_mount_container
 
                 print(
                     f"   - Storage: {len(job_mounts)} mount(s) with evaluation ID isolation"
@@ -857,9 +914,13 @@ def _dry_run_lepton(
 ) -> None:
     print("DRY RUN: Lepton job configurations prepared")
     try:
-        # validate tasks
+        # validate tasks (container overrides are supported)
         for task in cfg.evaluation.tasks:
-            get_task_from_mapping(task.name, tasks_mapping)
+            _ = get_task_definition_for_job(
+                task_query=task.name,
+                base_mapping=tasks_mapping,
+                container=task.get("container"),
+            )
 
         # nice-to-have checks (existing endpoint URL or endpoints mapping)
         if getattr(cfg.deployment, "type", None) == "none":
@@ -877,7 +938,11 @@ def _dry_run_lepton(
         else:
             endpoints_cfg = getattr(cfg.deployment, "endpoints", {}) or {}
             for task in cfg.evaluation.tasks:
-                td = get_task_from_mapping(task.name, tasks_mapping)
+                td = get_task_definition_for_job(
+                    task_query=task.name,
+                    base_mapping=tasks_mapping,
+                    container=task.get("container"),
+                )
                 etype = td.get("endpoint_type")
                 if etype not in endpoints_cfg:
                     raise ValueError(
@@ -896,9 +961,21 @@ def _dry_run_lepton(
             getattr(cfg, "target", {}).get("api_endpoint", {}), "api_key_name", None
         )
         for task in cfg.evaluation.tasks:
-            td = get_task_from_mapping(task.name, tasks_mapping)
+            td = get_task_definition_for_job(
+                task_query=task.name,
+                base_mapping=tasks_mapping,
+                container=task.get("container"),
+            )
             required = td.get("required_env_vars", []) or []
             for var in required:
+                # Skip NEMO_EVALUATOR_DATASET_DIR as it's handled by dataset mounting logic
+                if var == "NEMO_EVALUATOR_DATASET_DIR":
+                    if "dataset_dir" not in task:
+                        raise ValueError(
+                            f"Task '{task.name}' requires dataset_dir to be specified. "
+                            f"Add 'dataset_dir: /path/to/your/dataset' under the task configuration."
+                        )
+                    continue
                 if var == "API_KEY":
                     if not (("API_KEY" in lepton_env_vars) or bool(api_key_name)):
                         raise ValueError(

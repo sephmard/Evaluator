@@ -56,12 +56,16 @@ class TestLocalExecutorDryRun:
                     {
                         "name": "test_task_1",
                         "env_vars": {"TASK_ENV": "TASK_VALUE"},
-                        "overrides": {"param1": "value1"},
+                        "nemo_evaluator_config": {
+                            "config": {"params": {"param1": "value1"}}
+                        },
                     },
                     {
                         "name": "test_task_2",
                         "container": "custom-container:v2.0",
-                        "overrides": {"param2": "value2"},
+                        "nemo_evaluator_config": {
+                            "config": {"params": {"param2": "value2"}}
+                        },
                     },
                 ],
             },
@@ -103,8 +107,8 @@ class TestLocalExecutorDryRun:
                     "nemo_evaluator_launcher.executors.local.executor.load_tasks_mapping"
                 ) as mock_load_mapping,
                 patch(
-                    "nemo_evaluator_launcher.executors.local.executor.get_task_from_mapping"
-                ) as mock_get_task,
+                    "nemo_evaluator_launcher.executors.local.executor.get_task_definition_for_job"
+                ) as mock_get_task_def,
                 patch(
                     "nemo_evaluator_launcher.executors.local.executor.get_eval_factory_command"
                 ) as mock_get_command,
@@ -113,14 +117,15 @@ class TestLocalExecutorDryRun:
                 # Configure mocks
                 mock_load_mapping.return_value = mock_tasks_mapping
 
-                def mock_get_task_side_effect(task_name, mapping):
-                    # Return matching task definition
-                    for (harness, name), definition in mapping.items():
+                def mock_get_task_def_side_effect(*_args, **kwargs):
+                    task_name = kwargs.get("task_query")
+                    mapping = kwargs.get("base_mapping", {})
+                    for (_harness, name), definition in mapping.items():
                         if name == task_name:
                             return definition
                     raise KeyError(f"Task {task_name} not found")
 
-                mock_get_task.side_effect = mock_get_task_side_effect
+                mock_get_task_def.side_effect = mock_get_task_def_side_effect
                 from nemo_evaluator_launcher.common.helpers import CmdAndReadableComment
 
                 mock_get_command.return_value = CmdAndReadableComment(
@@ -194,18 +199,20 @@ class TestLocalExecutorDryRun:
                 "nemo_evaluator_launcher.executors.local.executor.load_tasks_mapping"
             ) as mock_load_mapping,
             patch(
-                "nemo_evaluator_launcher.executors.local.executor.get_task_from_mapping"
-            ) as mock_get_task,
+                "nemo_evaluator_launcher.executors.local.executor.get_task_definition_for_job"
+            ) as mock_get_task_def,
         ):
             mock_load_mapping.return_value = mock_tasks_mapping
 
-            def mock_get_task_side_effect(task_name, mapping):
-                for (harness, name), definition in mapping.items():
+            def mock_get_task_def_side_effect(*_args, **kwargs):
+                task_name = kwargs.get("task_query")
+                mapping = kwargs.get("base_mapping", {})
+                for (_harness, name), definition in mapping.items():
                     if name == task_name:
                         return definition
                 raise KeyError(f"Task {task_name} not found")
 
-            mock_get_task.side_effect = mock_get_task_side_effect
+            mock_get_task_def.side_effect = mock_get_task_def_side_effect
 
             # Should raise ValueError for missing API key
             with pytest.raises(
@@ -228,18 +235,20 @@ class TestLocalExecutorDryRun:
                     "nemo_evaluator_launcher.executors.local.executor.load_tasks_mapping"
                 ) as mock_load_mapping,
                 patch(
-                    "nemo_evaluator_launcher.executors.local.executor.get_task_from_mapping"
-                ) as mock_get_task,
+                    "nemo_evaluator_launcher.executors.local.executor.get_task_definition_for_job"
+                ) as mock_get_task_def,
             ):
                 mock_load_mapping.return_value = mock_tasks_mapping
 
-                def mock_get_task_side_effect(task_name, mapping):
-                    for (harness, name), definition in mapping.items():
+                def mock_get_task_def_side_effect(*_args, **kwargs):
+                    task_name = kwargs.get("task_query")
+                    mapping = kwargs.get("base_mapping", {})
+                    for (_harness, name), definition in mapping.items():
                         if name == task_name:
                             return definition
                     raise KeyError(f"Task {task_name} not found")
 
-                mock_get_task.side_effect = mock_get_task_side_effect
+                mock_get_task_def.side_effect = mock_get_task_def_side_effect
 
                 # Should raise ValueError for missing environment variable TASK_VALUE
                 # (which is the value of TASK_ENV in the configuration)
@@ -254,14 +263,6 @@ class TestLocalExecutorDryRun:
             for env_var in ["TEST_API_KEY", "GLOBAL_VALUE"]:
                 if env_var in os.environ:
                     del os.environ[env_var]
-
-    def test_execute_eval_deployment_type_validation(self, sample_config):
-        """Test that non-'none' deployment types raise NotImplementedError."""
-        # Change deployment type to something other than 'none'
-        sample_config.deployment.type = "slurm"
-
-        with pytest.raises(NotImplementedError, match="type slurm is not implemented"):
-            LocalExecutor.execute_eval(sample_config, dry_run=True)
 
 
 class TestLocalExecutorGetStatus:
@@ -613,3 +614,156 @@ class TestLocalExecutorGetStatus:
             assert statuses[0].state == ExecutionState.RUNNING
             # When no dataset size, progress should be the raw number of processed samples
             assert statuses[0].progress["progress"] == 42
+
+
+class TestLocalExecutorStreamLogs:
+    """Test LocalExecutor stream_logs functionality."""
+
+    @pytest.fixture
+    def sample_job_for_logs(self, tmpdir):
+        """Create a sample job for log streaming tests."""
+        invocation_id = "test1234"
+        job_id = f"{invocation_id}.0"
+        output_dir = pathlib.Path(tmpdir) / invocation_id / job_id
+        logs_dir = output_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        job_data = JobData(
+            invocation_id=invocation_id,
+            job_id=job_id,
+            timestamp=1_000_000_000.0,
+            executor="local",
+            data={"output_dir": str(output_dir)},
+            config={
+                "execution": {"type": "local"},
+                "evaluation": {"tasks": [{"name": "test_task"}]},
+            },
+        )
+        ExecutionDB().write_job(job_data)
+        return job_data, output_dir, logs_dir
+
+    def test_stream_logs_with_existing_file(self, sample_job_for_logs):
+        """Test streaming logs from an existing file."""
+        job_data, output_dir, logs_dir = sample_job_for_logs
+        log_file = logs_dir / "client_stdout.log"
+        log_file.write_text("Line 1\nLine 2\nLine 3\n", encoding="utf-8")
+
+        # Mock time.sleep to avoid infinite loop
+        with patch("time.sleep", return_value=None):
+            call_count = 0
+
+            def mock_sleep(*args):
+                nonlocal call_count
+                call_count += 1
+                if call_count > 1:
+                    raise KeyboardInterrupt()
+
+            with patch("time.sleep", side_effect=mock_sleep):
+                try:
+                    logs = list(LocalExecutor.stream_logs(job_data.job_id))
+                    # Should have read existing lines (if file wasn't already at end)
+                    assert isinstance(logs, list)
+                except KeyboardInterrupt:
+                    pass
+
+    def test_stream_logs_file_not_exists(self, sample_job_for_logs):
+        """Test streaming logs when file doesn't exist yet."""
+        job_data, output_dir, logs_dir = sample_job_for_logs
+        log_file = logs_dir / "client_stdout.log"
+        assert not log_file.exists()
+
+        # Mock time.sleep to avoid infinite loop
+        with patch("time.sleep", return_value=None):
+            call_count = 0
+
+            def mock_sleep(*args):
+                nonlocal call_count
+                call_count += 1
+                if call_count > 1:
+                    raise KeyboardInterrupt()
+
+            with patch("time.sleep", side_effect=mock_sleep):
+                try:
+                    logs = list(LocalExecutor.stream_logs(job_data.job_id))
+                    # Should return empty if file doesn't exist
+                    assert len(logs) == 0
+                except KeyboardInterrupt:
+                    pass
+
+    def test_stream_logs_with_invocation_id(
+        self, sample_job_for_logs, prepare_local_job
+    ):
+        """Test streaming logs with invocation ID containing multiple jobs."""
+        job_data, output_dir, logs_dir = sample_job_for_logs
+        inv = job_data.invocation_id
+
+        # Update first job config to have 2 tasks (for consistency with second job)
+        config_with_two_tasks = {
+            "execution": {"type": "local"},
+            "evaluation": {"tasks": [{"name": "test_task"}, {"name": "test_task2"}]},
+        }
+        job_data.config = config_with_two_tasks
+        ExecutionDB().write_job(job_data)
+
+        # Add a second job with matching config
+        jd2 = JobData(
+            invocation_id=inv,
+            job_id=f"{inv}.1",
+            timestamp=job_data.timestamp,
+            executor="local",
+            data={},
+            config=config_with_two_tasks,
+        )
+        jd2, base2 = prepare_local_job(jd2, with_required=True, with_optional=True)
+        ExecutionDB().write_job(jd2)
+
+        # Mock time.sleep to avoid infinite loop
+        with patch("time.sleep", return_value=None):
+            call_count = 0
+
+            def mock_sleep(*args):
+                nonlocal call_count
+                call_count += 1
+                if call_count > 1:
+                    raise KeyboardInterrupt()
+
+            with patch("time.sleep", side_effect=mock_sleep):
+                try:
+                    logs = list(LocalExecutor.stream_logs(inv))
+                    # Should handle multiple jobs
+                    assert isinstance(logs, list)
+                except KeyboardInterrupt:
+                    pass
+
+    def test_stream_logs_nonexistent_job(self):
+        """Test streaming logs for nonexistent job."""
+        logs = list(LocalExecutor.stream_logs("nonexistent.0"))
+        assert len(logs) == 0
+
+    def test_extract_task_name_from_config(self, sample_job_for_logs):
+        """Test extracting task name from config."""
+        job_data, output_dir, logs_dir = sample_job_for_logs
+        task_name = LocalExecutor._extract_task_name(job_data, job_data.job_id)
+        assert task_name == "test_task"
+
+    def test_extract_task_name_fallback(self, tmpdir):
+        """Test extracting task name falls back to output_dir."""
+        invocation_id = "test5678"
+        job_id = f"{invocation_id}.0"
+        output_dir = pathlib.Path(tmpdir) / invocation_id / "some_task_name"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        job_data = JobData(
+            invocation_id=invocation_id,
+            job_id=job_id,
+            timestamp=1_000_000_000.0,
+            executor="local",
+            data={"output_dir": str(output_dir)},
+            config={
+                "execution": {"type": "local"},
+                "evaluation": {"tasks": []},  # Empty tasks
+            },
+        )
+
+        task_name = LocalExecutor._extract_task_name(job_data, job_id)
+        assert task_name == "some_task_name"

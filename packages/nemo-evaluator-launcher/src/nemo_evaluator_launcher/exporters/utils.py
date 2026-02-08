@@ -38,10 +38,42 @@ from nemo_evaluator_launcher.common.mapping import (
 REQUIRED_ARTIFACTS = ["results.yml", "eval_factory_metrics.json"]
 OPTIONAL_ARTIFACTS = ["omni-info.json"]
 
+# Glob-style patterns to exclude when only_required=false (applied recursively)
+# Matches: cache/, response_stats_cache/, lm_cache_rank0.db/, *.lock, synthetic/, etc.
+EXCLUDED_PATTERNS = ["*cache*", "*.db", "*.lock", "synthetic", "debug.json"]
+
 
 def get_relevant_artifacts() -> List[str]:
     """Get relevant artifacts (required + optional)."""
     return REQUIRED_ARTIFACTS + OPTIONAL_ARTIFACTS
+
+
+def should_exclude_artifact(name: str) -> bool:
+    """Check if artifact should be excluded based on glob patterns."""
+    name_lower = name.lower()
+    for pattern in EXCLUDED_PATTERNS:
+        p = pattern.lower()
+        if p.startswith("*") and p.endswith("*"):
+            # *cache* - contains match
+            if p[1:-1] in name_lower:
+                return True
+        elif p.startswith("*"):
+            # *.db, *.lock - suffix match
+            if name_lower.endswith(p[1:]):
+                return True
+        elif name_lower == p:
+            # exact match at any depth (synthetic, debug.json)
+            return True
+    return False
+
+
+def get_copytree_ignore() -> Callable[[str, List[str]], List[str]]:
+    """Return ignore function for shutil.copytree() that excludes artifacts recursively."""
+
+    def ignore_func(directory: str, contents: List[str]) -> List[str]:
+        return [name for name in contents if should_exclude_artifact(name)]
+
+    return ignore_func
 
 
 def validate_artifacts(artifacts_dir: Path) -> Dict[str, Any]:
@@ -416,12 +448,34 @@ def ssh_download_artifacts(
                 if scp_file(remote_file, local_file):
                     exported_files.append(str(local_file))
         else:
-            # Copy known files individually to avoid subfolders and satisfy tests
-            for artifact in get_available_artifacts(paths.get("artifacts_dir", Path())):
-                remote_file = f"{paths['remote_path']}/artifacts/{artifact}"
-                local_file = art_dir / artifact
-                if scp_file(remote_file, local_file):
-                    exported_files.append(str(local_file))
+            # Use tar+ssh to bundle many small files into one transfer
+            # This is much faster than rsync for directories with thousands of files
+            exclude_args = " ".join(f"--exclude={p}" for p in EXCLUDED_PATTERNS)
+
+            # Build SSH command
+            ssh_cmd = ["ssh"] + ssh_opts
+            remote_tar_cmd = (
+                f"cd {paths['remote_path']} && tar -czf - {exclude_args} artifacts/"
+            )
+
+            # Stream tar from remote, extract locally
+            ssh_full = ssh_cmd + [
+                f"{paths['username']}@{paths['hostname']}",
+                remote_tar_cmd,
+            ]
+            with subprocess.Popen(
+                ssh_full, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            ) as ssh_proc:
+                tar_extract = subprocess.run(
+                    ["tar", "-xzf", "-", "-C", str(export_dir)],
+                    stdin=ssh_proc.stdout,
+                    capture_output=True,
+                )
+                ssh_proc.wait()
+                if ssh_proc.returncode == 0 and tar_extract.returncode == 0:
+                    exported_files.extend(
+                        [str(f) for f in art_dir.rglob("*") if f.is_file()]
+                    )
 
     # Logs (top-level only)
     if copy_logs:
@@ -584,6 +638,60 @@ def _safe_update_metrics(
     """Update target from source safely, raising on collisions with detailed values."""
     for k, v in source.items():
         _safe_set_metric(target, k, v, context)
+
+
+# =============================================================================
+# CONFIG FLATTENING
+# =============================================================================
+
+
+def flatten_config(
+    config: Any,
+    parent_key: str = "",
+    sep: str = ".",
+    max_depth: int = 10,
+) -> Dict[str, str]:
+    """
+    Flatten a nested config dict into dot-notation keys.
+
+    Args:
+        config: Nested configuration (dict, list, or scalar)
+        parent_key: Prefix for keys (used in recursion)
+        sep: Separator between nested keys
+        max_depth: Maximum recursion depth to prevent infinite loops
+
+    Returns:
+        Flattened dictionary with string values
+
+    Examples:
+        >>> flatten_config({"a": {"b": 1}})
+        {"a.b": "1"}
+        >>> flatten_config({"tasks": [{"name": "foo"}, {"name": "bar"}]})
+        {"tasks.0.name": "foo", "tasks.1.name": "bar"}
+    """
+    if max_depth <= 0:
+        return {parent_key: str(config)} if parent_key else {}
+
+    if isinstance(config, dict):
+        items: Dict[str, str] = {}
+        for key, value in config.items():
+            new_key = f"{parent_key}{sep}{key}" if parent_key else key
+            items.update(flatten_config(value, new_key, sep, max_depth - 1))
+        return items
+
+    if isinstance(config, list):
+        items: Dict[str, str] = {}
+        for idx, item in enumerate(config):
+            item_key = f"{parent_key}{sep}{idx}" if parent_key else str(idx)
+            items.update(flatten_config(item, item_key, sep, max_depth - 1))
+        return items
+
+    # Scalar value
+    if not parent_key:
+        return {}
+    if config is None:
+        return {parent_key: "null"}
+    return {parent_key: str(config)}
 
 
 # =============================================================================

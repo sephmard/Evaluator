@@ -18,8 +18,9 @@
 This module provides the main functional entry points for running evaluations, querying job status, and listing available tasks. These functions are intended to be used by CLI commands and external integrations.
 """
 
+import copy
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import yaml
 from omegaconf import DictConfig, OmegaConf
@@ -35,7 +36,7 @@ def get_tasks_list() -> list[list[Any]]:
     """Get a list of available tasks from the mapping.
 
     Returns:
-        list[list[Any]]: Each sublist contains task name, endpoint type, harness, and container.
+        list[list[Any]]: Each sublist contains task name, endpoint type, harness, container, arch, description, and type.
     """
     mapping = load_tasks_mapping()
     data = [
@@ -44,6 +45,9 @@ def get_tasks_list() -> list[list[Any]]:
             task_data.get("endpoint_type"),
             task_data.get("harness"),
             task_data.get("container"),
+            task_data.get("arch", ""),
+            task_data.get("description", ""),
+            task_data.get("type", ""),
         ]
         for task_data in mapping.values()
     ]
@@ -75,12 +79,54 @@ def _validate_no_missing_values(cfg: Any, path: str = "") -> None:
             _validate_no_missing_values(value, current_path)
 
 
-def run_eval(cfg: RunConfig, dry_run: bool = False) -> Optional[str]:
+def filter_tasks(cfg: RunConfig, task_names: list[str]) -> RunConfig:
+    """Filter evaluation tasks to only include specified task names.
+
+    Args:
+        cfg: The configuration object for the evaluation run.
+        task_names: List of task names to include (e.g., ["ifeval", "gsm8k"]).
+
+    Returns:
+        RunConfig: A new configuration with filtered tasks (input is not mutated).
+
+    Raises:
+        ValueError: If any requested task is not found in config or no tasks defined.
+    """
+    if not task_names:
+        return cfg
+
+    if not hasattr(cfg.evaluation, "tasks") or not cfg.evaluation.tasks:
+        raise ValueError("No tasks defined in config. Cannot filter tasks.")
+
+    requested_tasks = set(task_names)
+    original_tasks = cfg.evaluation.tasks
+    filtered_tasks = [task for task in original_tasks if task.name in requested_tasks]
+
+    # Fail if ANY requested tasks are not found
+    found_names = {task.name for task in filtered_tasks}
+    not_found = requested_tasks - found_names
+    if not_found:
+        available = [task.name for task in original_tasks]
+        raise ValueError(
+            f"Requested task(s) not found in config: {sorted(not_found)}. "
+            f"Available tasks: {available}"
+        )
+
+    # Create a deep copy to preserve input immutability
+    result = copy.deepcopy(cfg)
+    result.evaluation.tasks = filtered_tasks
+    return result
+
+
+def run_eval(
+    cfg: RunConfig, dry_run: bool = False, tasks: Optional[list[str]] = None
+) -> Optional[str]:
     """Run evaluation with specified config and overrides.
 
     Args:
         cfg: The configuration object for the evaluation run.
         dry_run: If True, do not run the evaluation, just prepare scripts and save them.
+        tasks: Optional list of task names to run. If provided, only these tasks will be executed.
 
     Returns:
         Optional[str]: The invocation ID for the evaluation run.
@@ -89,6 +135,10 @@ def run_eval(cfg: RunConfig, dry_run: bool = False) -> Optional[str]:
         ValueError: If configuration validation fails or MISSING values are found.
         RuntimeError: If the executor fails to start the evaluation.
     """
+    # Filter tasks if specified
+    if tasks:
+        cfg = filter_tasks(cfg, tasks)
+
     # Validate that no MISSING values exist in the configuration
     _validate_no_missing_values(cfg)
 
@@ -116,6 +166,7 @@ def get_status(ids_or_prefixes: list[str]) -> list[dict[str, Any]]:
     db = ExecutionDB()
     results: List[dict[str, Any]] = []
 
+    # TODO(agronskiy): refactor the `.`-checking job in all the functions.
     for id_or_prefix in ids_or_prefixes:
         # If id looks like an invocation_id (no dot), get all jobs for it
         if "." not in id_or_prefix:
@@ -259,6 +310,108 @@ def get_status(ids_or_prefixes: list[str]) -> list[dict[str, Any]]:
     return results
 
 
+def stream_logs(
+    ids_or_prefixes: Union[str, list[str]],
+) -> Iterator[Tuple[str, str, str]]:
+    """Stream logs from jobs or invocations by their IDs or invocation IDs.
+
+    Args:
+        ids_or_prefixes: Single ID/prefix or list of job IDs or invocation IDs to stream logs from.
+                         Short prefixes are allowed, we would try to match the full ones from
+                         prefixes if no collisions are present.
+
+    Yields:
+        Tuple[str, str, str]: Tuples of (job_id, task_name, log_line) for each log line.
+            Empty lines are yielded as empty strings.
+
+    Raises:
+        ValueError: If the executor doesn't support log streaming.
+    """
+    db = ExecutionDB()
+
+    # Normalize to list for consistent processing
+    if isinstance(ids_or_prefixes, str):
+        ids_or_prefixes = [ids_or_prefixes]
+
+    # Collect all jobs from all IDs, grouped by executor
+    executor_to_jobs: Dict[str, Dict[str, JobData]] = {}
+    executor_to_invocations: Dict[str, list[str]] = {}
+
+    # TODO(agronskiy): refactor the `.`-checking job in all the functions.
+    for id_or_prefix in ids_or_prefixes:
+        # Determine if this is a job ID or invocation ID
+        if "." in id_or_prefix:
+            # This is a job ID
+            job_data = db.get_job(id_or_prefix)
+            if job_data is None:
+                continue
+
+            executor = job_data.executor
+            if executor not in executor_to_jobs:
+                executor_to_jobs[executor] = {}
+            executor_to_jobs[executor][id_or_prefix] = job_data
+        else:
+            # This is an invocation ID
+            jobs = db.get_jobs(id_or_prefix)
+            if not jobs:
+                continue
+
+            # Get the executor class from the first job
+            first_job_data = next(iter(jobs.values()))
+            executor = first_job_data.executor
+            if executor not in executor_to_invocations:
+                executor_to_invocations[executor] = []
+            executor_to_invocations[executor].append(id_or_prefix)
+
+    # Stream logs from each executor simultaneously
+    # For each executor, collect all job IDs and stream them together
+    for executor, jobs_dict in executor_to_jobs.items():
+        try:
+            executor_cls = get_executor(executor)
+        except ValueError:
+            continue
+
+        # For local executor with multiple jobs, pass list to stream simultaneously
+        # For other executors or single jobs, pass individual job IDs
+        if executor == "local" and len(jobs_dict) > 1:
+            # Pass all job IDs as a list to stream simultaneously
+            try:
+                yield from executor_cls.stream_logs(
+                    list(jobs_dict.keys()), executor_name=executor
+                )
+            except NotImplementedError:
+                raise ValueError(
+                    f"Log streaming is not yet implemented for executor '{executor}'"
+                )
+        else:
+            # Single job or non-local executor
+            for job_id in jobs_dict.keys():
+                try:
+                    yield from executor_cls.stream_logs(job_id, executor_name=executor)
+                except NotImplementedError:
+                    raise ValueError(
+                        f"Log streaming is not yet implemented for executor '{executor}'"
+                    )
+
+    # Stream logs from invocation IDs
+    for executor, invocation_ids in executor_to_invocations.items():
+        try:
+            executor_cls = get_executor(executor)
+        except ValueError:
+            continue
+
+        # Stream each invocation (each invocation already handles multiple jobs internally)
+        for invocation_id in invocation_ids:
+            try:
+                yield from executor_cls.stream_logs(
+                    invocation_id, executor_name=executor
+                )
+            except NotImplementedError:
+                raise ValueError(
+                    f"Log streaming is not yet implemented for executor '{executor}'"
+                )
+
+
 def list_all_invocations_summary() -> list[dict[str, Any]]:
     """Return a concise per-invocation summary from the exec DB.
 
@@ -378,6 +531,7 @@ def kill_job_or_invocation(id: str) -> list[dict[str, Any]]:
                 "data": {"error": f"Unexpected error: {str(e)}"},
             }
 
+    # TODO(agronskiy): refactor the `.`-checking job in all the functions.
     # Determine if this is a job ID or invocation ID
     if "." in id:
         # This is a job ID - kill single job
@@ -413,7 +567,7 @@ def kill_job_or_invocation(id: str) -> list[dict[str, Any]]:
 
 
 def export_results(
-    invocation_ids: Union[str, List[str]],
+    invocation_ids: Union[str, list[str]],
     dest: str = "local",
     config: dict[Any, Any] | None = None,
 ) -> dict:
@@ -442,7 +596,7 @@ def export_results(
             if "." in single_id:  # job_id
                 # Try reading config from artifacts working dir (auto-export on remote node)
                 cfg_file = None
-                for name in ("run_config.yml", "config.yml"):
+                for name in ("config.yml", "run_config.yml"):
                     p = Path(name)
                     if p.exists():
                         cfg_file = p

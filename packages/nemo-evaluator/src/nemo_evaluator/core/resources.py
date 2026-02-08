@@ -27,6 +27,8 @@ import psutil
 from nemo_evaluator.api.api_dataclasses import EvaluationResult
 from nemo_evaluator.logging.utils import logger
 
+__all__ = []
+
 
 def get_token_usage_from_cache_db(cache_db_path: str | Path) -> dict:
     """Extract token usage metrics from the cache database.
@@ -267,9 +269,8 @@ def monitor_memory_usage(
             time.sleep(interval_ms / 1000.0)
 
     th = threading.Thread(target=sampler, daemon=True)
-    th.start()
-
     start_time = time.time()
+    th.start()
 
     try:
         # Filter out cache_dir from kwargs since the target function doesn't expect it

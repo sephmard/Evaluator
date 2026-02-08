@@ -30,6 +30,7 @@ from nemo_evaluator_launcher.executors.base import ExecutionState, ExecutionStat
 from nemo_evaluator_launcher.executors.slurm.executor import (
     SlurmExecutor,
     _create_slurm_sbatch_script,
+    _generate_autoresume_handler,
 )
 
 
@@ -45,6 +46,10 @@ class TestSlurmExecutorFeatures:
                 "image": "test-image:latest",
                 "command": "test-command",
                 "served_model_name": "test-model",
+                "port": 8000,
+                "endpoints": {
+                    "health": "/health",
+                },
             },
             "execution": {
                 "type": "slurm",
@@ -81,14 +86,8 @@ class TestSlurmExecutorFeatures:
                 "nemo_evaluator_launcher.executors.slurm.executor.load_tasks_mapping"
             ) as mock_load_tasks,
             patch(
-                "nemo_evaluator_launcher.executors.slurm.executor.get_task_from_mapping"
-            ) as mock_get_task,
-            patch(
-                "nemo_evaluator_launcher.executors.slurm.executor.get_health_url"
-            ) as mock_get_health,
-            patch(
-                "nemo_evaluator_launcher.executors.slurm.executor.get_endpoint_url"
-            ) as mock_get_endpoint,
+                "nemo_evaluator_launcher.executors.slurm.executor.get_task_definition_for_job"
+            ) as mock_get_task_def,
             patch(
                 "nemo_evaluator_launcher.common.helpers.get_eval_factory_command"
             ) as mock_get_eval_command,
@@ -97,14 +96,12 @@ class TestSlurmExecutorFeatures:
             ) as mock_get_model_name,
         ):
             mock_load_tasks.return_value = {}
-            mock_get_task.return_value = {
+            mock_get_task_def.return_value = {
                 "container": "test-eval-container:latest",
                 "required_env_vars": [],
                 "endpoint_type": "openai",
                 "task": "test_task",
             }
-            mock_get_health.return_value = "http://localhost:8000/health"
-            mock_get_endpoint.return_value = "http://localhost:8000/v1"
             from nemo_evaluator_launcher.common.helpers import CmdAndReadableComment
 
             mock_get_eval_command.return_value = CmdAndReadableComment(
@@ -114,9 +111,7 @@ class TestSlurmExecutorFeatures:
 
             yield {
                 "load_tasks_mapping": mock_load_tasks,
-                "get_task_from_mapping": mock_get_task,
-                "get_health_url": mock_get_health,
-                "get_endpoint_url": mock_get_endpoint,
+                "get_task_definition_for_job": mock_get_task_def,
                 "get_eval_factory_command": mock_get_eval_command,
                 "get_served_model_name": mock_get_model_name,
             }
@@ -442,6 +437,11 @@ class TestSlurmExecutorFeatures:
         assert "evaluation client" in script
         assert "--container-env EVAL_VAR" in script
 
+        # PRIMARY_NODE should be resolved even without deployment
+        assert "Resolve PRIMARY_NODE for single-node sruns" in script
+        assert 'export PRIMARY_NODE="${nodes_array[0]}"' in script
+        assert '--nodelist "${PRIMARY_NODE}" --nodes 1 --ntasks 1 ' in script
+
     def test_complex_configuration_integration(
         self, base_config, mock_task, mock_dependencies
     ):
@@ -500,6 +500,453 @@ class TestSlurmExecutorFeatures:
         # mount_home=False should add --no-container-mount-home
         assert "--no-container-mount-home" in script
 
+    @pytest.mark.parametrize(
+        "num_nodes,n_tasks,expected_ntasks,should_have_proxy",
+        [
+            (1, 1, 1, False),  # Single instance, no proxy
+            (4, 4, 4, True),  # Multi-instance with matching n_tasks, needs proxy
+            (2, 1, 1, False),  # Multiple nodes but single task, no proxy
+            (3, 3, 3, True),  # Multi-instance with 3 nodes, needs proxy
+        ],
+    )
+    def test_deployment_n_tasks_and_proxy_setup(
+        self,
+        base_config,
+        mock_task,
+        mock_dependencies,
+        num_nodes,
+        n_tasks,
+        expected_ntasks,
+        should_have_proxy,
+    ):
+        """Test deployment.n_tasks with various configurations and proxy setup."""
+        base_config["execution"]["deployment"] = {"n_tasks": n_tasks}
+        base_config["execution"]["num_nodes"] = num_nodes
+        # Set multiple_instances to trigger proxy setup when needed
+        base_config["deployment"]["multiple_instances"] = should_have_proxy
+
+        cfg = OmegaConf.create(base_config)
+
+        script = _create_slurm_sbatch_script(
+            cfg=cfg,
+            task=mock_task,
+            eval_image="test-eval-container:latest",
+            remote_task_subdir=Path("/test/remote"),
+            invocation_id="test123",
+            job_id="test123.0",
+        ).cmd
+
+        # Check that deployment srun uses correct --ntasks value
+        assert f"--nodes {num_nodes} --ntasks {expected_ntasks}" in script
+
+        # Check proxy setup based on multi-instance or not
+        if should_have_proxy:
+            assert "proxy" in script.lower()
+        else:
+            assert "proxy" not in script.lower()
+
+    def test_deployment_n_tasks_default_value(
+        self, base_config, mock_task, mock_dependencies
+    ):
+        """Test deployment.n_tasks defaults to 1 when not specified."""
+        # Don't set deployment.n_tasks - should default to 1
+        base_config["execution"]["num_nodes"] = 2
+
+        cfg = OmegaConf.create(base_config)
+
+        script = _create_slurm_sbatch_script(
+            cfg=cfg,
+            task=mock_task,
+            eval_image="test-eval-container:latest",
+            remote_task_subdir=Path("/test/remote"),
+            invocation_id="test123",
+            job_id="test123.0",
+        ).cmd
+
+        # Check that deployment srun defaults to --ntasks 1
+        assert "--nodes 2 --ntasks 1" in script
+
+        # Check that no proxy is set up (since n_tasks=1, even though num_nodes=2)
+        assert "proxy" not in script.lower()
+
+
+class TestMaxWalltimeFeature:
+    """Test maximum wall-clock time feature for preventing infinite job resuming."""
+
+    @pytest.fixture
+    def base_config(self):
+        """Base configuration for testing."""
+        return {
+            "deployment": {
+                "type": "vllm",
+                "image": "test-image:latest",
+                "command": "test-command",
+                "served_model_name": "test-model",
+                "port": 8000,
+                "endpoints": {
+                    "health": "/health",
+                },
+            },
+            "execution": {
+                "type": "slurm",
+                "output_dir": "/test/output",
+                "walltime": "01:00:00",
+                "account": "test-account",
+                "partition": "test-partition",
+                "num_nodes": 1,
+                "ntasks_per_node": 1,
+                "subproject": "test-subproject",
+            },
+            "evaluation": {"env_vars": {}},
+            "target": {"api_endpoint": {"url": "http://localhost:8000/v1"}},
+        }
+
+    @pytest.fixture
+    def mock_task(self):
+        """Mock task configuration."""
+        return OmegaConf.create({"name": "test_task"})
+
+    @pytest.fixture
+    def mock_dependencies(self):
+        """Mock external dependencies used by _create_slurm_sbatch_script."""
+        with (
+            patch(
+                "nemo_evaluator_launcher.executors.slurm.executor.load_tasks_mapping"
+            ) as mock_load_tasks,
+            patch(
+                "nemo_evaluator_launcher.executors.slurm.executor.get_task_definition_for_job"
+            ) as mock_get_task_def,
+            patch(
+                "nemo_evaluator_launcher.common.helpers.get_eval_factory_command"
+            ) as mock_get_eval_command,
+            patch(
+                "nemo_evaluator_launcher.common.helpers.get_served_model_name"
+            ) as mock_get_model_name,
+        ):
+            mock_load_tasks.return_value = {}
+            mock_get_task_def.return_value = {
+                "container": "test-eval-container:latest",
+                "required_env_vars": [],
+                "endpoint_type": "openai",
+                "task": "test_task",
+            }
+            from nemo_evaluator_launcher.common.helpers import CmdAndReadableComment
+
+            mock_get_eval_command.return_value = CmdAndReadableComment(
+                cmd="nemo-evaluator run_eval --test", debug="# Test command"
+            )
+            mock_get_model_name.return_value = "test-model"
+
+            yield {
+                "load_tasks_mapping": mock_load_tasks,
+                "get_task_definition_for_job": mock_get_task_def,
+                "get_eval_factory_command": mock_get_eval_command,
+                "get_served_model_name": mock_get_model_name,
+            }
+
+    def test_generate_autoresume_handler_without_max_walltime(self):
+        """Test autoresume handler generation without max_walltime."""
+        handler = _generate_autoresume_handler(Path("/test/remote"), max_walltime=None)
+
+        # Should have basic autoresume logic
+        assert "_this_script=$0" in handler
+        assert "_prev_slurm_job_id=$1" in handler
+        assert "sbatch --dependency=afternotok:$SLURM_JOB_ID" in handler
+
+        # Should NOT have max_walltime checks
+        assert "_max_walltime=" not in handler
+        assert "Maximum total walltime" not in handler
+        assert "_accumulated_seconds" not in handler
+
+    def test_generate_autoresume_handler_with_max_walltime(self):
+        """Test autoresume handler generation with max_walltime."""
+        handler = _generate_autoresume_handler(
+            Path("/test/remote"), max_walltime="24:00:00"
+        )
+
+        # Should have basic autoresume logic
+        assert "_this_script=$0" in handler
+        assert "_prev_slurm_job_id=$1" in handler
+        assert "sbatch --dependency=afternotok:$SLURM_JOB_ID" in handler
+
+        # Should have max_walltime checks
+        assert '_max_walltime="24:00:00"' in handler
+        assert "/test/remote/.job_start_time" in handler
+        assert "/test/remote/.accumulated_walltime" in handler
+        assert "_walltime_to_seconds()" in handler
+        assert "_accumulated_seconds" in handler
+        assert "Maximum total walltime" in handler
+        assert "Stopping job chain to prevent infinite resuming" in handler
+        # Should use sacct to get actual elapsed time from previous jobs
+        assert "sacct -j $_prev_slurm_job_id -P -n -o Elapsed" in handler
+
+    def test_generate_autoresume_handler_max_walltime_formats(self):
+        """Test autoresume handler with various max_walltime formats."""
+        # Test HH:MM:SS format
+        handler = _generate_autoresume_handler(
+            Path("/test/remote"), max_walltime="12:30:45"
+        )
+        assert '_max_walltime="12:30:45"' in handler
+
+        # Test short format
+        handler = _generate_autoresume_handler(
+            Path("/test/remote"), max_walltime="02:00:00"
+        )
+        assert '_max_walltime="02:00:00"' in handler
+
+    def test_create_sbatch_script_without_max_walltime(
+        self, base_config, mock_task, mock_dependencies
+    ):
+        """Test sbatch script generation without explicit max_walltime uses default."""
+        cfg = OmegaConf.create(base_config)
+
+        script = _create_slurm_sbatch_script(
+            cfg=cfg,
+            task=mock_task,
+            eval_image="test-eval-container:latest",
+            remote_task_subdir=Path("/test/remote"),
+            invocation_id="test123",
+            job_id="test123.0",
+        ).cmd
+
+        # Should have autoresume logic WITH default max_walltime (120:00:00 = 5 days)
+        assert "_this_script=$0" in script
+        assert "sbatch --dependency=afternotok:$SLURM_JOB_ID" in script
+        assert '_max_walltime="120:00:00"' in script
+        assert "_accumulated_walltime_file" in script
+        assert "Maximum total walltime" in script
+
+    def test_create_sbatch_script_with_max_walltime(
+        self, base_config, mock_task, mock_dependencies
+    ):
+        """Test sbatch script generation with max_walltime."""
+        base_config["execution"]["max_walltime"] = "24:00:00"
+        cfg = OmegaConf.create(base_config)
+
+        script = _create_slurm_sbatch_script(
+            cfg=cfg,
+            task=mock_task,
+            eval_image="test-eval-container:latest",
+            remote_task_subdir=Path("/test/remote"),
+            invocation_id="test123",
+            job_id="test123.0",
+        ).cmd
+
+        # Should have autoresume logic WITH max_walltime checks
+        assert "_this_script=$0" in script
+        assert "sbatch --dependency=afternotok:$SLURM_JOB_ID" in script
+        assert '_max_walltime="24:00:00"' in script
+        assert "_accumulated_seconds" in script
+        assert "Maximum total walltime" in script
+        # Should use sacct for accurate walltime tracking
+        assert "sacct" in script
+
+    def test_create_sbatch_script_max_walltime_null(
+        self, base_config, mock_task, mock_dependencies
+    ):
+        """Test sbatch script generation with max_walltime explicitly set to null for unlimited."""
+        base_config["execution"]["max_walltime"] = None
+        cfg = OmegaConf.create(base_config)
+
+        script = _create_slurm_sbatch_script(
+            cfg=cfg,
+            task=mock_task,
+            eval_image="test-eval-container:latest",
+            remote_task_subdir=Path("/test/remote"),
+            invocation_id="test123",
+            job_id="test123.0",
+        ).cmd
+
+        # When explicitly set to None, should have autoresume logic but NO max_walltime checks
+        assert "_this_script=$0" in script
+        assert "sbatch --dependency=afternotok:$SLURM_JOB_ID" in script
+        assert "_max_walltime=" not in script
+        assert "_accumulated_walltime_file" not in script
+
+    def test_autoresume_handler_creates_start_time_file(self):
+        """Test that autoresume handler creates accumulated walltime file on first run."""
+        handler = _generate_autoresume_handler(
+            Path("/test/remote"), max_walltime="08:00:00"
+        )
+
+        # Should create accumulated walltime file on first run or manual resume
+        assert "_accumulated_walltime_file" in handler
+        assert 'echo "0" > "$_accumulated_walltime_file"' in handler
+        assert "Job chain started at" in handler
+        # Should still write start time for current job
+        assert 'date +%s > "$_start_time_file"' in handler
+
+    def test_autoresume_handler_time_conversion(self):
+        """Test that autoresume handler includes time conversion logic."""
+        handler = _generate_autoresume_handler(
+            Path("/test/remote"), max_walltime="10:30:00"
+        )
+
+        # Should have time conversion function
+        assert "_walltime_to_seconds()" in handler
+        assert "hours * 3600 + minutes * 60 + seconds" in handler
+
+        # Should handle different time formats
+        assert "HH:MM:SS" in handler or "BASH_REMATCH" in handler
+
+    def test_autoresume_handler_elapsed_time_formatting(self):
+        """Test that autoresume handler formats elapsed time for logging."""
+        handler = _generate_autoresume_handler(
+            Path("/test/remote"), max_walltime="04:00:00"
+        )
+
+        # Should format elapsed time for human-readable output
+        assert "_elapsed_formatted" in handler
+        assert "printf" in handler
+
+
+class TestSlurmExecutorHelperFunctions:
+    """Test individual helper functions used by SLURM executor."""
+
+    @pytest.mark.parametrize(
+        "num_nodes,n_tasks,has_mounts,mount_home,expected_nodes,expected_ntasks,expected_mount_home_flag",
+        [
+            (1, 1, False, True, 1, 1, False),  # Single node, no mounts, mount home
+            (4, 4, False, True, 4, 4, False),  # Multi-node, no mounts, mount home
+            (2, 1, True, True, 2, 1, False),  # Multi-node single task with mounts
+            (1, 1, False, False, 1, 1, True),  # Single node, no mount home
+            (3, 3, True, False, 3, 3, True),  # Multi-node with mounts, no mount home
+        ],
+    )
+    def test_generate_deployment_srun_command(
+        self,
+        num_nodes,
+        n_tasks,
+        has_mounts,
+        mount_home,
+        expected_nodes,
+        expected_ntasks,
+        expected_mount_home_flag,
+    ):
+        """Test _generate_deployment_srun_command with various configurations."""
+        from nemo_evaluator_launcher.executors.slurm.executor import (
+            _generate_deployment_srun_command,
+        )
+
+        # Create config
+        config = {
+            "deployment": {
+                "type": "vllm",
+                "image": "test-image:latest",
+                "command": "python -m vllm.entrypoints.openai.api_server --model /model",
+            },
+            "execution": {
+                "num_nodes": num_nodes,
+                "deployment": {"n_tasks": n_tasks},
+                "mounts": {"mount_home": mount_home},
+            },
+        }
+        cfg = OmegaConf.create(config)
+
+        # Create mounts list
+        mounts_list = ["/host/path:/container/path"] if has_mounts else []
+
+        # Generate command
+        command, _, _ = _generate_deployment_srun_command(
+            cfg=cfg,
+            deployment_mounts_list=mounts_list,
+            remote_task_subdir=Path("/test/remote"),
+        )
+
+        # Verify nodes and ntasks
+        assert f"--nodes {expected_nodes} --ntasks {expected_ntasks}" in command
+
+        # Verify image
+        assert "test-image:latest" in command
+
+        # Verify mounts
+        if has_mounts:
+            assert "/host/path:/container/path" in command
+
+        # Verify mount_home flag
+        if expected_mount_home_flag:
+            assert "--no-container-mount-home" in command
+        else:
+            assert "--no-container-mount-home" not in command
+
+        # Verify node IP collection
+        assert "NODES_IPS_ARRAY" in command
+        assert "MASTER_IP" in command
+
+    @pytest.mark.parametrize(
+        "ip_list,port,health_path,service_name,check_pid,expected_in_output",
+        [
+            (
+                '"127.0.0.1"',
+                8000,
+                "/health",
+                "server",
+                True,
+                ["127.0.0.1", "8000", "/health", "server", "SERVER_PID"],
+            ),
+            (
+                '"${NODES_IPS_ARRAY[@]}"',
+                5009,
+                "/status",
+                "Proxy",
+                False,
+                ["NODES_IPS_ARRAY", "5009", "/status", "Proxy"],
+            ),
+            (
+                '"10.0.0.1"',
+                8080,
+                "/ready",
+                "service",
+                True,
+                ["10.0.0.1", "8080", "/ready", "service", "SERVER_PID"],
+            ),
+            (
+                '"${NODES_IPS_ARRAY[@]}"',
+                8000,
+                "/health",
+                "server",
+                True,
+                ["NODES_IPS_ARRAY", "8000", "/health", "SERVER_PID"],
+            ),
+        ],
+    )
+    def test_get_wait_for_server_handler(
+        self, ip_list, port, health_path, service_name, check_pid, expected_in_output
+    ):
+        """Test _get_wait_for_server_handler with various configurations."""
+        from nemo_evaluator_launcher.executors.slurm.executor import (
+            _get_wait_for_server_handler,
+        )
+
+        # Generate handler
+        handler = _get_wait_for_server_handler(
+            ip_list=ip_list,
+            port=port,
+            health_check_path=health_path,
+            service_name=service_name,
+            check_pid=check_pid,
+        )
+
+        # Verify all expected strings are in output
+        for expected in expected_in_output:
+            assert expected in handler
+
+        # Verify PID check logic
+        if check_pid:
+            assert "SERVER_PID" in handler
+            assert "kill -0" in handler
+        else:
+            assert "kill -0" not in handler
+
+        # Verify curl command structure
+        assert "curl -s -o /dev/null" in handler
+        assert f"http://$ip:{port}{health_path}" in handler
+
+        # Verify loop structure
+        assert "for ip in" in handler
+        assert "while" in handler
+        assert "done" in handler
+
 
 class TestSlurmExecutorDryRun:
     """Test SlurmExecutor dry run functionality."""
@@ -543,12 +990,14 @@ class TestSlurmExecutorDryRun:
                     {
                         "name": "mmlu_pro",
                         "env_vars": {"TASK_ENV": "TASK_VALUE"},
-                        "overrides": {"num_fewshot": 5},
+                        "nemo_evaluator_config": {
+                            "config": {"params": {"temperature": 0.95}}
+                        },
                     },
                     {
                         "name": "gsm8k",
                         "container": "custom-math-container:v2.0",
-                        "overrides": {"batch_size": 16},
+                        "nemo_evaluator_config": {"config": {"params": {"top_p": 0.1}}},
                     },
                 ],
             },
@@ -589,38 +1038,31 @@ class TestSlurmExecutorDryRun:
                     "nemo_evaluator_launcher.executors.slurm.executor.load_tasks_mapping"
                 ) as mock_load_mapping,
                 patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_from_mapping"
-                ) as mock_get_task,
+                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_definition_for_job"
+                ) as mock_get_task_def,
                 patch(
                     "nemo_evaluator_launcher.executors.slurm.executor.get_eval_factory_command"
                 ) as mock_get_command,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_health_url"
-                ) as mock_get_health,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_endpoint_url"
-                ) as mock_get_endpoint,
                 patch("builtins.print") as mock_print,
             ):
                 # Configure mocks
                 mock_load_mapping.return_value = mock_tasks_mapping
 
-                def mock_get_task_side_effect(task_name, mapping):
-                    # Return matching task definition
-                    for (harness, name), definition in mapping.items():
+                def mock_get_task_def_side_effect(*_args, **kwargs):
+                    task_name = kwargs.get("task_query")
+                    mapping = kwargs.get("base_mapping", {})
+                    for (_harness, name), definition in mapping.items():
                         if name == task_name:
                             return definition
                     raise KeyError(f"Task {task_name} not found")
 
-                mock_get_task.side_effect = mock_get_task_side_effect
+                mock_get_task_def.side_effect = mock_get_task_def_side_effect
                 from nemo_evaluator_launcher.common.helpers import CmdAndReadableComment
 
                 mock_get_command.return_value = CmdAndReadableComment(
                     cmd="nemo-evaluator-launcher --model llama-3.1-8b-instruct --task {task_name}",
                     debug="# Test command for dry run",
                 )
-                mock_get_health.return_value = "http://localhost:8000/health"
-                mock_get_endpoint.return_value = "http://localhost:8000/v1"
 
                 # Execute dry run
                 invocation_id = SlurmExecutor.execute_eval(sample_config, dry_run=True)
@@ -657,18 +1099,20 @@ class TestSlurmExecutorDryRun:
                 "nemo_evaluator_launcher.executors.slurm.executor.load_tasks_mapping"
             ) as mock_load_mapping,
             patch(
-                "nemo_evaluator_launcher.executors.slurm.executor.get_task_from_mapping"
-            ) as mock_get_task,
+                "nemo_evaluator_launcher.executors.slurm.executor.get_task_definition_for_job"
+            ) as mock_get_task_def,
         ):
             mock_load_mapping.return_value = mock_tasks_mapping
 
-            def mock_get_task_side_effect(task_name, mapping):
-                for (harness, name), definition in mapping.items():
+            def mock_get_task_def_side_effect(*_args, **kwargs):
+                task_name = kwargs.get("task_query")
+                mapping = kwargs.get("base_mapping", {})
+                for (_harness, name), definition in mapping.items():
                     if name == task_name:
                         return definition
                 raise KeyError(f"Task {task_name} not found")
 
-            mock_get_task.side_effect = mock_get_task_side_effect
+            mock_get_task_def.side_effect = mock_get_task_def_side_effect
 
             # Should raise ValueError for missing API key
             with pytest.raises(
@@ -691,18 +1135,20 @@ class TestSlurmExecutorDryRun:
                     "nemo_evaluator_launcher.executors.slurm.executor.load_tasks_mapping"
                 ) as mock_load_mapping,
                 patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_from_mapping"
-                ) as mock_get_task,
+                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_definition_for_job"
+                ) as mock_get_task_def,
             ):
                 mock_load_mapping.return_value = mock_tasks_mapping
 
-                def mock_get_task_side_effect(task_name, mapping):
-                    for (harness, name), definition in mapping.items():
+                def mock_get_task_def_side_effect(*_args, **kwargs):
+                    task_name = kwargs.get("task_query")
+                    mapping = kwargs.get("base_mapping", {})
+                    for (_harness, name), definition in mapping.items():
                         if name == task_name:
                             return definition
                     raise KeyError(f"Task {task_name} not found")
 
-                mock_get_task.side_effect = mock_get_task_side_effect
+                mock_get_task_def.side_effect = mock_get_task_def_side_effect
 
                 # Should raise ValueError for missing environment variable TASK_VALUE
                 # (which is the value of TASK_ENV in the configuration)
@@ -733,36 +1179,30 @@ class TestSlurmExecutorDryRun:
                     "nemo_evaluator_launcher.executors.slurm.executor.load_tasks_mapping"
                 ) as mock_load_mapping,
                 patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_from_mapping"
-                ) as mock_get_task,
+                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_definition_for_job"
+                ) as mock_get_task_def,
                 patch(
                     "nemo_evaluator_launcher.executors.slurm.executor.get_eval_factory_command"
                 ) as mock_get_command,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_health_url"
-                ) as mock_get_health,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_endpoint_url"
-                ) as mock_get_endpoint,
                 patch("builtins.print"),
             ):
                 mock_load_mapping.return_value = mock_tasks_mapping
 
-                def mock_get_task_side_effect(task_name, mapping):
-                    for (harness, name), definition in mapping.items():
+                def mock_get_task_def_side_effect(*_args, **kwargs):
+                    task_name = kwargs.get("task_query")
+                    mapping = kwargs.get("base_mapping", {})
+                    for (_harness, name), definition in mapping.items():
                         if name == task_name:
                             return definition
                     raise KeyError(f"Task {task_name} not found")
 
-                mock_get_task.side_effect = mock_get_task_side_effect
+                mock_get_task_def.side_effect = mock_get_task_def_side_effect
                 from nemo_evaluator_launcher.common.helpers import CmdAndReadableComment
 
                 mock_get_command.return_value = CmdAndReadableComment(
                     cmd="nemo-evaluator-launcher --task test_command",
                     debug="# Test command for custom container",
                 )
-                mock_get_health.return_value = "http://localhost:8000/health"
-                mock_get_endpoint.return_value = "http://localhost:8000/v1"
 
                 # Execute dry run
                 invocation_id = SlurmExecutor.execute_eval(sample_config, dry_run=True)
@@ -795,36 +1235,30 @@ class TestSlurmExecutorDryRun:
                     "nemo_evaluator_launcher.executors.slurm.executor.load_tasks_mapping"
                 ) as mock_load_mapping,
                 patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_from_mapping"
-                ) as mock_get_task,
+                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_definition_for_job"
+                ) as mock_get_task_def,
                 patch(
                     "nemo_evaluator_launcher.executors.slurm.executor.get_eval_factory_command"
                 ) as mock_get_command,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_health_url"
-                ) as mock_get_health,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_endpoint_url"
-                ) as mock_get_endpoint,
                 patch("builtins.print"),
             ):
                 mock_load_mapping.return_value = mock_tasks_mapping
 
-                def mock_get_task_side_effect(task_name, mapping):
-                    for (harness, name), definition in mapping.items():
+                def mock_get_task_def_side_effect(*_args, **kwargs):
+                    task_name = kwargs.get("task_query")
+                    mapping = kwargs.get("base_mapping", {})
+                    for (_harness, name), definition in mapping.items():
                         if name == task_name:
                             return definition
                     raise KeyError(f"Task {task_name} not found")
 
-                mock_get_task.side_effect = mock_get_task_side_effect
+                mock_get_task_def.side_effect = mock_get_task_def_side_effect
                 from nemo_evaluator_launcher.common.helpers import CmdAndReadableComment
 
                 mock_get_command.return_value = CmdAndReadableComment(
                     cmd="nemo-evaluator-launcher --task test_command",
                     debug="# Test command for no auto-export",
                 )
-                mock_get_health.return_value = "http://localhost:8000/health"
-                mock_get_endpoint.return_value = "http://localhost:8000/v1"
 
                 # Should execute successfully without auto-export
                 invocation_id = SlurmExecutor.execute_eval(sample_config, dry_run=True)
@@ -1068,7 +1502,7 @@ class TestSlurmExecutorGetStatus:
             ) as mock_progress,
         ):
             mock_open.return_value = "/tmp/socket"
-            mock_query_status.return_value = {"123456789": "COMPLETED"}
+            mock_query_status.return_value = {"123456789": ("COMPLETED", "123456789")}
             mock_autoresume.return_value = {"123456789": ["123456789"]}
             mock_progress.return_value = [0.8]
 
@@ -1113,8 +1547,10 @@ class TestSlurmExecutorGetStatus:
             mock_open.return_value = "/tmp/socket"
             # Initial job was preempted, latest job is running
             mock_query_status.side_effect = [
-                {"123456789": "PREEMPTED"},  # Original job status
-                {"123456790": "RUNNING"},  # Latest autoresumed job status
+                {"123456789": ("PREEMPTED", "123456789")},  # Original job status
+                {
+                    "123456790": ("RUNNING", "123456790")
+                },  # Latest autoresumed job status
             ]
             # Autoresume shows there's a newer job ID
             mock_autoresume.return_value = {"123456789": ["123456789", "123456790"]}
@@ -1159,7 +1595,7 @@ class TestSlurmExecutorGetStatus:
             ) as mock_progress,
         ):
             mock_open.return_value = "/tmp/socket"
-            mock_query_status.return_value = {"123456789": "RUNNING"}
+            mock_query_status.return_value = {"123456789": ("RUNNING", "123456789")}
             mock_autoresume.return_value = {"123456789": ["123456789"]}
             mock_progress.return_value = [None]  # Unknown progress
 
@@ -1218,7 +1654,9 @@ class TestSlurmExecutorSystemCalls:
                     {
                         "name": "mmlu_pro",
                         "env_vars": {"TASK_ENV": "TASK_VALUE"},
-                        "overrides": {"num_fewshot": 5},
+                        "nemo_evaluator_config": {
+                            "config": {"params": {"temperature": 0.95}}
+                        },
                     }
                 ],
             },
@@ -1291,37 +1729,35 @@ class TestSlurmExecutorSystemCalls:
                     "nemo_evaluator_launcher.executors.slurm.executor.load_tasks_mapping"
                 ) as mock_load_mapping,
                 patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_from_mapping"
-                ) as mock_get_task,
+                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_definition_for_job"
+                ) as mock_get_task_def,
                 patch(
                     "nemo_evaluator_launcher.executors.slurm.executor.get_eval_factory_command"
                 ) as mock_get_command,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_health_url"
-                ) as mock_get_health,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_endpoint_url"
-                ) as mock_get_endpoint,
                 patch("subprocess.run", side_effect=mock_subprocess_run),
+                patch(
+                    "nemo_evaluator_launcher.executors.slurm.executor._open_master_connection"
+                ) as mock_open_connection,
             ):
                 # Configure mocks
                 mock_load_mapping.return_value = mock_tasks_mapping
+                mock_open_connection.return_value = "/tmp/socket"
 
-                def mock_get_task_side_effect(task_name, mapping):
-                    for (harness, name), definition in mapping.items():
+                def mock_get_task_def_side_effect(*_args, **kwargs):
+                    task_name = kwargs.get("task_query")
+                    mapping = kwargs.get("base_mapping", {})
+                    for (_harness, name), definition in mapping.items():
                         if name == task_name:
                             return definition
                     raise KeyError(f"Task {task_name} not found")
 
-                mock_get_task.side_effect = mock_get_task_side_effect
+                mock_get_task_def.side_effect = mock_get_task_def_side_effect
                 from nemo_evaluator_launcher.common.helpers import CmdAndReadableComment
 
                 mock_get_command.return_value = CmdAndReadableComment(
                     cmd="nemo-evaluator-launcher --task mmlu_pro",
                     debug="# Test command for mmlu_pro",
                 )
-                mock_get_health.return_value = "http://127.0.0.1:8000/health"
-                mock_get_endpoint.return_value = "http://127.0.0.1:8000/v1"
 
                 # Execute non-dry-run
                 invocation_id = SlurmExecutor.execute_eval(sample_config, dry_run=False)
@@ -1387,43 +1823,37 @@ class TestSlurmExecutorSystemCalls:
                     "nemo_evaluator_launcher.executors.slurm.executor.load_tasks_mapping"
                 ) as mock_load_mapping,
                 patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_from_mapping"
-                ) as mock_get_task,
+                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_definition_for_job"
+                ) as mock_get_task_def,
                 patch(
                     "nemo_evaluator_launcher.executors.slurm.executor.get_eval_factory_command"
                 ) as mock_get_command,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_health_url"
-                ) as mock_get_health,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_endpoint_url"
-                ) as mock_get_endpoint,
                 patch("subprocess.run", side_effect=mock_subprocess_run),
             ):
                 # Configure mocks
                 mock_load_mapping.return_value = mock_tasks_mapping
 
-                def mock_get_task_side_effect(task_name, mapping):
-                    for (harness, name), definition in mapping.items():
+                def mock_get_task_def_side_effect(*_args, **kwargs):
+                    task_name = kwargs.get("task_query")
+                    mapping = kwargs.get("base_mapping", {})
+                    for (_harness, name), definition in mapping.items():
                         if name == task_name:
                             return definition
                     raise KeyError(f"Task {task_name} not found")
 
-                mock_get_task.side_effect = mock_get_task_side_effect
+                mock_get_task_def.side_effect = mock_get_task_def_side_effect
                 from nemo_evaluator_launcher.common.helpers import CmdAndReadableComment
 
                 mock_get_command.return_value = CmdAndReadableComment(
                     cmd="nemo-evaluator-launcher --task mmlu_pro",
                     debug="# Test command for mmlu_pro SSH failure",
                 )
-                mock_get_health.return_value = "http://127.0.0.1:8000/health"
-                mock_get_endpoint.return_value = "http://127.0.0.1:8000/v1"
 
-                # Should still succeed (SSH connection can be None)
-                invocation_id = SlurmExecutor.execute_eval(sample_config, dry_run=False)
-
-                assert isinstance(invocation_id, str)
-                assert len(invocation_id) == 16
+                with pytest.raises(
+                    RuntimeError,
+                    match="Failed to connect to the cluster slurm.example.com as user testuser. Please check your SSH configuration.",
+                ):
+                    SlurmExecutor.execute_eval(sample_config, dry_run=False)
 
         finally:
             # Clean up environment
@@ -1480,37 +1910,31 @@ class TestSlurmExecutorSystemCalls:
                     "nemo_evaluator_launcher.executors.slurm.executor.load_tasks_mapping"
                 ) as mock_load_mapping,
                 patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_from_mapping"
-                ) as mock_get_task,
+                    "nemo_evaluator_launcher.executors.slurm.executor.get_task_definition_for_job"
+                ) as mock_get_task_def,
                 patch(
                     "nemo_evaluator_launcher.executors.slurm.executor.get_eval_factory_command"
                 ) as mock_get_command,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_health_url"
-                ) as mock_get_health,
-                patch(
-                    "nemo_evaluator_launcher.executors.slurm.executor.get_endpoint_url"
-                ) as mock_get_endpoint,
                 patch("subprocess.run", side_effect=mock_subprocess_run),
             ):
                 # Configure mocks
                 mock_load_mapping.return_value = mock_tasks_mapping
 
-                def mock_get_task_side_effect(task_name, mapping):
-                    for (harness, name), definition in mapping.items():
+                def mock_get_task_def_side_effect(*_args, **kwargs):
+                    task_name = kwargs.get("task_query")
+                    mapping = kwargs.get("base_mapping", {})
+                    for (_harness, name), definition in mapping.items():
                         if name == task_name:
                             return definition
                     raise KeyError(f"Task {task_name} not found")
 
-                mock_get_task.side_effect = mock_get_task_side_effect
+                mock_get_task_def.side_effect = mock_get_task_def_side_effect
                 from nemo_evaluator_launcher.common.helpers import CmdAndReadableComment
 
                 mock_get_command.return_value = CmdAndReadableComment(
                     cmd="nemo-evaluator-launcher --task mmlu_pro",
                     debug="# Test command for mmlu_pro sbatch failure",
                 )
-                mock_get_health.return_value = "http://127.0.0.1:8000/health"
-                mock_get_endpoint.return_value = "http://127.0.0.1:8000/v1"
 
                 # Should raise RuntimeError for sbatch failure
                 with pytest.raises(
@@ -1531,13 +1955,26 @@ class TestSlurmExecutorSystemCalls:
         )
 
         def mock_subprocess_run(*args, **kwargs):
-            """Mock subprocess.run for sacct command."""
-            # Mock sacct output
-            return Mock(
-                returncode=0,
-                stdout=b"123456789|COMPLETED\n123456790|RUNNING\n",
-                stderr=b"",
+            """Mock subprocess.run for squeue and sacct commands."""
+            cmd_args = kwargs.get("args", [])
+            if not cmd_args:
+                return Mock(returncode=1, stdout=b"", stderr=b"")
+
+            cmd_str = (
+                " ".join(cmd_args) if isinstance(cmd_args, list) else str(cmd_args)
             )
+
+            if "squeue" in cmd_str:
+                # Mock squeue with no active jobs (empty output)
+                return Mock(returncode=0, stdout=b"", stderr=b"")
+            elif "sacct" in cmd_str:
+                # Mock sacct output
+                return Mock(
+                    returncode=0,
+                    stdout=b"123456789|COMPLETED\n123456790|RUNNING\n",
+                    stderr=b"",
+                )
+            return Mock(returncode=1, stdout=b"", stderr=b"")
 
         with patch("subprocess.run", side_effect=mock_subprocess_run):
             result = _query_slurm_jobs_status(
@@ -1547,7 +1984,8 @@ class TestSlurmExecutorSystemCalls:
                 socket="/tmp/socket",
             )
 
-            assert result == {"123456789": "COMPLETED", "123456790": "RUNNING"}
+            assert result["123456789"] == ("COMPLETED", "123456789")
+            assert result["123456790"] == ("RUNNING", "123456790")
 
     def test_query_slurm_jobs_status_failure(self):
         """Test _query_slurm_jobs_status function with failed subprocess call."""
@@ -1569,6 +2007,137 @@ class TestSlurmExecutorSystemCalls:
                     hostname="slurm.example.com",
                     socket="/tmp/socket",
                 )
+
+    def test_query_squeue_for_jobs_success(self):
+        """Test _query_squeue_for_jobs function with successful subprocess call."""
+        from nemo_evaluator_launcher.executors.slurm.executor import (
+            _query_squeue_for_jobs,
+        )
+
+        def mock_subprocess_run(*args, **kwargs):
+            """Mock subprocess.run for squeue command."""
+            # Mock squeue output with various job formats
+            return Mock(
+                returncode=0,
+                stdout=b"123456789|RUNNING|\n123456790_0|PENDING|(null)\n123456791[1-10]|PENDING|\n",
+                stderr=b"",
+            )
+
+        with patch("subprocess.run", side_effect=mock_subprocess_run):
+            result = _query_squeue_for_jobs(
+                slurm_job_ids=["123456789", "123456790", "123456791"],
+                username="testuser",
+                hostname="slurm.example.com",
+                socket="/tmp/socket",
+            )
+
+            assert result["123456789"] == ("RUNNING", "123456789")
+            assert result["123456790"] == ("PENDING", "123456790")
+            assert result["123456791"] == ("PENDING", "123456791")
+
+    def test_query_squeue_for_jobs_finds_dependent_jobs(self):
+        """Test that _query_squeue_for_jobs finds follow-up jobs that depend on known jobs."""
+        from nemo_evaluator_launcher.executors.slurm.executor import (
+            _query_squeue_for_jobs,
+        )
+
+        def mock_subprocess_run(*args, **kwargs):
+            """Mock subprocess.run for squeue command with dependent jobs."""
+            # Simulate: job 123456789 has finished (not in squeue),
+            # but job 123456790 is PENDING with dependency on 123456789
+            return Mock(
+                returncode=0,
+                stdout=b"123456790|PENDING|afternotok:123456789\n123456791|RUNNING|(null)\n",
+                stderr=b"",
+            )
+
+        with patch("subprocess.run", side_effect=mock_subprocess_run):
+            result = _query_squeue_for_jobs(
+                slurm_job_ids=["123456789", "123456791"],
+                username="testuser",
+                hostname="slurm.example.com",
+                socket="/tmp/socket",
+            )
+            assert result["123456789"] == (
+                "PENDING",
+                "123456790",
+            )  # Should find 123456789's status via its dependent job 123456790
+            assert result["123456791"] == (
+                "RUNNING",
+                "123456791",
+            )  # Direct match for 123456791
+
+    def test_query_slurm_jobs_status_combined_approach(self):
+        """Test _query_slurm_jobs_status using combined squeue + sacct approach."""
+        from nemo_evaluator_launcher.executors.slurm.executor import (
+            _query_slurm_jobs_status,
+        )
+
+        def mock_subprocess_run(*args, **kwargs):
+            """Mock subprocess.run for both squeue and sacct commands."""
+            # Get the command from kwargs['args'] since that's how subprocess.run is called
+            cmd_args = kwargs.get("args", [])
+            if not cmd_args:
+                return Mock(returncode=1, stdout=b"", stderr=b"")
+
+            cmd_str = (
+                " ".join(cmd_args) if isinstance(cmd_args, list) else str(cmd_args)
+            )
+
+            if "squeue" in cmd_str:
+                # Mock squeue showing only running jobs
+                return Mock(
+                    returncode=0,
+                    stdout=b"123456789|RUNNING|(null)\n",
+                    stderr=b"",
+                )
+            elif "sacct" in cmd_str:
+                # Mock sacct showing completed job that's not in squeue
+                return Mock(
+                    returncode=0,
+                    stdout=b"123456790|COMPLETED\n",
+                    stderr=b"",
+                )
+            return Mock(returncode=1, stdout=b"", stderr=b"")
+
+        with patch("subprocess.run", side_effect=mock_subprocess_run):
+            result = _query_slurm_jobs_status(
+                slurm_job_ids=["123456789", "123456790"],
+                username="testuser",
+                hostname="slurm.example.com",
+                socket="/tmp/socket",
+            )
+
+            # Should get running job from squeue and completed job from sacct
+            assert result["123456789"] == ("RUNNING", "123456789")
+            assert result["123456790"] == ("COMPLETED", "123456790")
+
+    def test_query_sacct_for_jobs_success(self):
+        """Test _query_sacct_for_jobs function with successful subprocess call."""
+        from nemo_evaluator_launcher.executors.slurm.executor import (
+            _query_sacct_for_jobs,
+        )
+
+        def mock_subprocess_run(*args, **kwargs):
+            """Mock subprocess.run for sacct command."""
+            return Mock(
+                returncode=0,
+                stdout=b"123456789|COMPLETED\n123456790|FAILED\n",
+                stderr=b"",
+            )
+
+        with patch("subprocess.run", side_effect=mock_subprocess_run):
+            result = _query_sacct_for_jobs(
+                slurm_job_ids=["123456789", "123456790"],
+                username="testuser",
+                hostname="slurm.example.com",
+                socket="/tmp/socket",
+            )
+
+            assert result == {
+                "123456789": ("COMPLETED", "123456789"),
+                "123456790": ("FAILED", "123456790"),
+            }
 
     def test_sbatch_remote_runsubs_success(self):
         """Test _sbatch_remote_runsubs function with successful subprocess call."""

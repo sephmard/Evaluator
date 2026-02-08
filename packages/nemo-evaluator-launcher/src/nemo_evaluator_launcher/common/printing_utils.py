@@ -28,6 +28,7 @@ USAGE:
 """
 
 import os
+import sys
 
 # If this env var is set, it will override a more standard "LOG_LEVEL". If
 # both are unset, default would be used.
@@ -35,9 +36,15 @@ _DISABLE_COLOR_ENV_VAR = "NEMO_EVALUATOR_DISABLE_COLOR"
 
 
 def _is_color_disabled():
+    # Check environment variable first
     env_var = os.environ.get(_DISABLE_COLOR_ENV_VAR, "0").lower()
 
     if "1" in env_var or "yes" in env_var or "y" in env_var or "true" in env_var:
+        return True
+
+    # If not explicitly disabled, check if stdout is a TTY
+    # Colors are disabled if output is not a TTY
+    if not sys.stdout.isatty():
         return True
 
     return False
@@ -55,39 +62,45 @@ _CODES: dict[str, str] = dict(
     reset="\033[0m",
 )
 
-# If the colors are disabled, we null-out all the codes.
-if _is_color_disabled():
-    for c in _CODES.keys():
-        _CODES[c] = ""
+
+def _apply(code_key: str, s: str) -> str:
+    """Apply an ANSI code if colors are enabled.
+
+    Note: Color enablement is evaluated at call time so tests that redirect
+    stdout (e.g. to StringIO) correctly disable ANSI sequences.
+    """
+    if _is_color_disabled():
+        return s
+    return _CODES[code_key] + s + _CODES["reset"]
 
 
 def green(s: str) -> str:
-    return _CODES["green"] + s + _CODES["reset"]
+    return _apply("green", s)
 
 
 def red(s: str) -> str:
-    return _CODES["red"] + s + _CODES["reset"]
+    return _apply("red", s)
 
 
 def red_bg(s: str) -> str:
-    return _CODES["red_bg"] + s + _CODES["reset"]
+    return _apply("red_bg", s)
 
 
 def cyan(s: str) -> str:
-    return _CODES["cyan"] + s + _CODES["reset"]
+    return _apply("cyan", s)
 
 
 def yellow(s: str) -> str:
-    return _CODES["yellow"] + s + _CODES["reset"]
+    return _apply("yellow", s)
 
 
 def magenta(s: str) -> str:
-    return _CODES["magenta"] + s + _CODES["reset"]
+    return _apply("magenta", s)
 
 
 def grey(s: str) -> str:
-    return _CODES["grey"] + s + _CODES["reset"]
+    return _apply("grey", s)
 
 
 def bold(s: str) -> str:
-    return _CODES["bold"] + s + _CODES["reset"]
+    return _apply("bold", s)

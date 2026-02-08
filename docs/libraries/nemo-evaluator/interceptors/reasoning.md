@@ -13,7 +13,7 @@ The `ResponseReasoningInterceptor` handles models that generate explicit reasoni
 ### CLI Configuration
 
 ```bash
---overrides 'target.api_endpoint.adapter_config.use_reasoning=True,target.api_endpoint.adapter_config.end_reasoning_token="</think>",target.api_endpoint.adapter_config.start_reasoning_token="<think>"'
+--overrides 'target.api_endpoint.adapter_config.process_reasoning_traces=True,target.api_endpoint.adapter_config.end_reasoning_token="</think>",target.api_endpoint.adapter_config.start_reasoning_token="<think>"'
 ```
 
 ### YAML Configuration
@@ -36,18 +36,7 @@ target:
 
 ## Configuration Options
 
-| Parameter | Description | Default | Type |
-|-----------|-------------|---------|------|
-| `start_reasoning_token` | Token that marks the start of reasoning section | `"<think>"` | str \| None |
-| `end_reasoning_token` | Token that marks the end of reasoning section | `"</think>"` | str |
-| `add_reasoning` | Whether to add reasoning information | `True` | bool |
-| `migrate_reasoning_content` | Migrate reasoning_content to content field with tokens | `False` | bool |
-| `enable_reasoning_tracking` | Enable reasoning tracking and logging | `True` | bool |
-| `include_if_not_finished` | Include reasoning content if reasoning is not finished (end token not found) | `True` | bool |
-| `stats_file_saving_interval` | How often (every N responses) to save stats to file | `None` | int \| None |
-| `enable_caching` | Whether to enable caching of reasoning statistics | `True` | bool |
-| `cache_dir` | Custom cache directory for reasoning stats | `"/tmp/reasoning_interceptor"` | str |
-| `logging_aggregated_stats_interval` | How often (every N responses) to log aggregated reasoning statistics | `100` | int |
+For detailed configuration options, please refer to the {ref}`interceptor_reference` Python API reference.
 
 ## Processing Examples
 
@@ -86,7 +75,9 @@ The interceptor automatically tracks the following statistics:
 | `total_responses` | Total number of responses processed |
 | `responses_with_reasoning` | Number of responses containing reasoning content |
 | `reasoning_finished_count` | Number of responses where reasoning completed (end token found) |
+| `reasoning_finished_ratio` | Percentage (expressed as ratio within 0-1) of responses where reasoning completed to all responses with reasoning |
 | `reasoning_started_count` | Number of responses where reasoning started |
+| `reasoning_unfinished_count` | Number of responses where reasoning started but did not complete (end token not found) |
 | `avg_reasoning_words` | Average word count in reasoning content |
 | `avg_reasoning_tokens` | Average token count in reasoning content |
 | `avg_original_content_words` | Average word count in original content (before processing) |

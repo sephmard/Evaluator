@@ -28,16 +28,37 @@ target:
         - name: system_message
           config:
             system_message: "You are a helpful AI assistant."
+            strategy: "prepend"  # Optional: "replace", "append", or "prepend" (default)
         - name: "endpoint"
           enabled: true
           config: {}
 ```
 
+**Example with different strategies:**
+
+```yaml
+# Replace existing system message
+- name: system_message
+  config:
+    system_message: "You are a precise assistant."
+    strategy: "replace"
+
+# Prepend to existing system message (default)
+- name: system_message
+  config:
+    system_message: "Important: "
+    strategy: "prepend"
+
+# Append to existing system message
+- name: system_message
+  config:
+    system_message: "Remember to be concise."
+    strategy: "append"
+```
+
 ## Configuration Options
 
-| Parameter | Description | Type | Required |
-|-----------|-------------|------|----------|
-| `system_message` | System message to add to requests | str | Yes |
+For detailed configuration options, please refer to the {ref}`interceptor_reference` Python API reference.
 
 ## Behavior
 

@@ -16,6 +16,7 @@
 import pathlib
 import time
 from dataclasses import dataclass
+from typing import Literal
 
 from simple_parsing import field
 
@@ -33,25 +34,18 @@ from nemo_evaluator_launcher.common.printing_utils import (
 class Cmd:
     """Run command parameters"""
 
-    config_name: str = field(
-        default="default",
-        alias=["-c", "--config-name"],
+    config: str | None = field(
+        default=None,
+        alias=["--config"],
         metadata={
-            "help": "Config name to use. Consult `nemo_evaluator_launcher.configs`"
+            "help": "Full path to config file. Uses Hydra by default (--config-mode=hydra). Use --config-mode=raw to load directly (bypasses Hydra)."
         },
     )
-    config_dir: str | None = field(
-        default=None,
-        alias=["-d", "--config-dir"],
+    config_mode: Literal["hydra", "raw"] = field(
+        default="hydra",
+        alias=["--config-mode"],
         metadata={
-            "help": "Path to user config directory. If provided, searches here first, then falls back to internal configs."
-        },
-    )
-    run_config_file: str | None = field(
-        default=None,
-        alias=["-f", "--run-config-file"],
-        metadata={
-            "help": "Path to a run config file to load directly (bypasses Hydra config loading)."
+            "help": "Config loading mode: 'hydra' (default) uses Hydra config system, 'raw' loads config file directly bypassing Hydra."
         },
     )
     override: list[str] = field(
@@ -68,6 +62,15 @@ class Cmd:
         alias=["-n", "--dry-run"],
         metadata={"help": "Do not run the evaluation, just print the config."},
     )
+    tasks: list[str] = field(
+        default_factory=list,
+        action="append",
+        nargs="?",
+        alias=["-t"],
+        metadata={
+            "help": "Run only specific tasks from the config. Example: -t ifeval -t gsm8k"
+        },
+    )
     config_output: str | None = field(
         default=None,
         alias=["--config-output"],
@@ -76,25 +79,57 @@ class Cmd:
         },
     )
 
+    def _parse_requested_tasks(self) -> list[str]:
+        """Parse -t arguments into a list of task names.
+
+        Handles None values that can be appended when using nargs="?" with action="append".
+        """
+        requested_tasks = []
+        for task_arg in self.tasks:
+            # Skip None or empty values (can happen with nargs="?")
+            if not task_arg:
+                continue
+            task_name = task_arg.strip()
+            if task_name and task_name not in requested_tasks:
+                requested_tasks.append(task_name)
+        return requested_tasks
+
     def execute(self) -> None:
         # Import heavy dependencies only when needed
         import yaml
         from omegaconf import OmegaConf
 
-        from nemo_evaluator_launcher.api.functional import RunConfig, run_eval
+        from nemo_evaluator_launcher.api.functional import (
+            RunConfig,
+            filter_tasks,
+            run_eval,
+        )
 
-        # Load configuration either from Hydra or from a run config file
-        if self.run_config_file:
-            # Validate that run config file is not used with other config options
-            if self.config_name != "default":
-                raise ValueError("Cannot use --run-config-file with --config-name")
-            if self.config_dir is not None:
-                raise ValueError("Cannot use --run-config-file with --config-dir")
+        # Validate config_mode value
+        if self.config_mode not in ["hydra", "raw"]:
+            raise ValueError(
+                f"Invalid --config-mode value: {self.config_mode}. Must be 'hydra' or 'raw'."
+            )
+
+        # Validate that raw mode requires --config
+        if self.config_mode == "raw" and self.config is None:
+            raise ValueError(
+                "--config-mode=raw requires --config to be specified. Raw mode loads config files directly."
+            )
+
+        # Parse requested tasks if -t is specified
+        requested_tasks = self._parse_requested_tasks() if self.tasks else None
+
+        # Load configuration either from Hydra or directly from a config file
+        if self.config_mode == "raw" and self.config:
+            # Validate that raw config loading is not used with other config options
             if self.override:
-                raise ValueError("Cannot use --run-config-file with --override")
+                raise ValueError(
+                    "Cannot use --config-mode=raw with --override. Raw mode only works with --config."
+                )
 
-            # Load from run config file
-            with open(self.run_config_file, "r") as f:
+            # Load from config file directly (bypass Hydra)
+            with open(self.config, "r") as f:
                 config_dict = yaml.safe_load(f)
 
             # Create RunConfig from the loaded data
@@ -102,9 +137,17 @@ class Cmd:
         else:
             # Load the complete Hydra configuration
             config = RunConfig.from_hydra(
-                config_name=self.config_name,
+                config=self.config,
                 hydra_overrides=self.override,
-                config_dir=self.config_dir,
+            )
+
+        # Apply task filtering if -t is specified
+        if requested_tasks:
+            config = filter_tasks(config, requested_tasks)
+            logger.info(
+                "Running filtered tasks",
+                count=len(config.evaluation.tasks),
+                tasks=[t.name for t in config.evaluation.tasks],
             )
 
         try:
@@ -150,7 +193,7 @@ class Cmd:
                 f.write("#\n")
                 f.write("# To rerun this exact configuration:\n")
                 f.write(
-                    f"# nemo-evaluator-launcher run --run-config-file {config_path}\n"
+                    f"# nemo-evaluator-launcher run --config {config_path} --config-mode=raw\n"
                 )
                 f.write("#\n")
                 f.write(config_yaml)
@@ -163,6 +206,10 @@ class Cmd:
             print(
                 bold(cyan("To check status: "))
                 + f"nemo-evaluator-launcher status {invocation_id}"
+            )
+            print(
+                bold(cyan("To view job info: "))
+                + f"nemo-evaluator-launcher info {invocation_id}"
             )
             print(
                 bold(cyan("To kill all jobs: "))
@@ -198,3 +245,5 @@ class Cmd:
                     )
                 )
             )
+
+        # Done.

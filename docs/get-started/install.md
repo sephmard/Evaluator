@@ -120,7 +120,7 @@ docker run --rm \
     nemo-evaluator run_eval \
         --eval_type mmlu_pro \
         --model_url https://integrate.api.nvidia.com/v1/chat/completions \
-        --model_id meta/llama-3.1-8b-instruct \
+        --model_id meta/llama-3.2-3b-instruct \
         --api_key_name NGC_API_KEY \
         --output_dir /workspace/results
 ```
@@ -155,8 +155,7 @@ cd Evaluator/
 
 export NGC_API_KEY=nvapi-...  # API Key with access to build.nvidia.com
 nemo-evaluator-launcher run \
-  --config-dir packages/nemo-evaluator-launcher/examples \
-  --config-name local_nvidia_nemotron_nano_9b_v2 \
+  --config packages/nemo-evaluator-launcher/examples/local_reasoning.yaml \
   --override execution.output_dir=nemotron-eval
 ```
 

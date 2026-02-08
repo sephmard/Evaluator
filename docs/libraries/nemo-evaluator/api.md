@@ -1,32 +1,6 @@
 # API Reference
 
-This document provides a comprehensive reference for the `nemo-evaluator` Python API.
 
-## Prerequisites
-
-- **Container way**: Use evaluation containers mentioned in {ref}`nemo-evaluator-containers`
-- **Package way**:
-
-  ```bash
-  pip install nemo-evaluator
-  ```
-
-  To run evaluations, you also need to install an evaluation framework package (for example, `nvidia-simple-evals`):
-  ```bash
-  pip install nvidia-simple-evals
-  ```
-
-## CLI vs. Programmatic Usage
-
-The NeMo Evaluator API supports two usage patterns:
-
-1. **CLI Usage** (Recommended): Use `nemo-evaluator run_eval` function which parses command line arguments
-2. **Programmatic Usage**: Use `evaluate()` function with configuration objects
-
-**When to Use Which:**
-
-- **CLI**: For command-line tools, scripts, and simple automation
-- **Programmatic**: For building custom applications, workflows, and integration with other systems
 
 ## Available Data Classes
 
@@ -65,7 +39,7 @@ def run_eval() -> None:
     
     CLI Arguments:
         --eval_type: Type of evaluation to run (such as "mmlu_pro", "gpqa_diamond")
-        --model_id: Model identifier (such as "meta/llama-3.1-8b-instruct")
+        --model_id: Model identifier (such as "meta/llama-3.2-3b-instruct")
         --model_url: API endpoint URL (such as "https://integrate.api.NVIDIA.com/v1/chat/completions" for chat endpoint type)
         --model_type: Endpoint type ("chat", "completions", "vlm", "embedding")
         --api_key_name: Environment variable name for API key integration with endpoints (optional)
@@ -134,7 +108,7 @@ eval_config = EvaluationConfig(
 target_config = EvaluationTarget(
     api_endpoint=ApiEndpoint(
         url="https://integrate.api.NVIDIA.com/v1/chat/completions",
-        model_id="meta/llama-3.1-8b-instruct",
+        model_id="meta/llama-3.2-3b-instruct",
         type="chat",
         api_key="MY_API_KEY" # Name of the environment variable that stores api_key
     )
@@ -322,8 +296,8 @@ interceptor_config = {
     "name": "system_message",
     "enabled": True,
     "config": {
-        "custom_system_prompt": "You are a helpful AI assistant.",
-        "override_existing": True
+        "system_message": "You are a helpful AI assistant.",
+        "strategy": "prepend"  # Optional: "replace", "append", or "prepend" (default)
     }
 }
 ```
@@ -331,14 +305,16 @@ interceptor_config = {
 **Features:**
 
 - Custom system prompt injection
-- Prompt override capabilities
+- Multiple strategies for handling existing system messages (replace, prepend, append)
 - Consistent system behavior
+- Flexible system message composition
 
 **Use Cases:**
 
 - Modify system prompts for different evaluation scenarios
 - Test different prompt variations without code changes
-- Override existing system messages for consistent behavior
+- Replace existing system messages for consistent behavior
+- Prepend or append instructions to existing system messages
 - A/B testing of different prompt strategies
 
 ### 5. Endpoint Interceptor

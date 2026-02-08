@@ -1,3 +1,6 @@
+---
+orphan: true
+---
 (code-generation)=
 
 # Code Generation Evaluation
@@ -22,19 +25,7 @@ Ensure you have:
 
 ### Pre-Flight Check
 
-Verify your setup before running code evaluation:
-
-```{literalinclude} ../_snippets/prerequisites/endpoint_check.py
-:language: python
-:start-after: "# [snippet-start]"
-:end-before: "# [snippet-end]"
-```
-
-:::{tip}
-**Run this script directly**: `python docs/evaluation/_snippets/prerequisites/endpoint_check.py`
-:::
-
----
+Verify your setup before running code evaluation: {ref}`deployment-testing-compatibility`.
 
 ## Choose Your Approach
 
@@ -50,16 +41,14 @@ nemo-evaluator-launcher ls tasks | grep -E "(mbpp|humaneval)"
 
 # Run MBPP evaluation
 nemo-evaluator-launcher run \
-    --config-dir packages/nemo-evaluator-launcher/examples \
-    --config-name local_llama_3_1_8b_instruct \
+    --config packages/nemo-evaluator-launcher/examples/local_basic.yaml \
     -o 'evaluation.tasks=["mbpp"]' \
     -o target.api_endpoint.url=https://integrate.api.nvidia.com/v1/chat/completions \
     -o target.api_endpoint.api_key=${YOUR_API_KEY}
 
 # Run multiple code generation benchmarks
 nemo-evaluator-launcher run \
-    --config-dir packages/nemo-evaluator-launcher/examples \
-    --config-name local_llama_3_1_8b_instruct \
+    --config packages/nemo-evaluator-launcher/examples/local_basic.yaml \
     -o 'evaluation.tasks=["mbpp", "humaneval"]'
 ```
 
@@ -91,7 +80,7 @@ eval_config = EvaluationConfig(
 target_config = EvaluationTarget(
     api_endpoint=ApiEndpoint(
         url="https://integrate.api.nvidia.com/v1/chat/completions",
-        model_id="meta/llama-3.1-8b-instruct", 
+        model_id="meta/llama-3.2-3b-instruct", 
         type=EndpointType.CHAT,
         api_key="your_api_key"
     )
@@ -118,7 +107,7 @@ export MY_API_KEY=your_api_key_here
 # Run code generation evaluation
 nemo-evaluator run_eval \
     --eval_type mbpp \
-    --model_id meta/llama-3.1-8b-instruct \
+    --model_id meta/llama-3.2-3b-instruct \
     --model_url https://integrate.api.nvidia.com/v1/chat/completions \
     --model_type chat \
     --api_key_name MY_API_KEY \
@@ -221,7 +210,7 @@ from nemo_evaluator.api.api_dataclasses import (
 target_config = EvaluationTarget(
     api_endpoint=ApiEndpoint(
         url="https://integrate.api.nvidia.com/v1/chat/completions",
-        model_id="meta/llama-3.1-8b-instruct", 
+        model_id="meta/llama-3.2-3b-instruct", 
         type=EndpointType.CHAT,
         api_key="your_api_key"
     )
